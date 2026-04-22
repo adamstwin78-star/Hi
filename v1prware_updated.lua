@@ -32,34 +32,46 @@ local fs = {
 }
 
 ------------------------------------------------------------------------
--- config
+-- config  (simple JSON save – no WindUI dependency)
 ------------------------------------------------------------------------
 local cfg = {}
 do
     local DIR  = "GlovSakenScript"
     local FILE = DIR .. "/config.json"
+    local saveThread = nil
+
     local function prep()
         if not fs.hasFolder(DIR) then fs.makeFolder(DIR) end
     end
+
     function cfg.load()
         prep()
         if not fs.hasFile(FILE) then return end
         local ok, t = pcall(svc.Http.JSONDecode, svc.Http, fs.read(FILE))
         if ok and type(t) == "table" then cfg._data = t end
     end
+
+    -- debounced save: collapses rapid successive calls into one write
     function cfg.save()
-        prep()
-        local ok, s = pcall(svc.Http.JSONEncode, svc.Http, cfg._data)
-        if ok then fs.write(FILE, s) end
+        if saveThread then task.cancel(saveThread) end
+        saveThread = task.delay(0.5, function()
+            saveThread = nil
+            prep()
+            local ok, s = pcall(svc.Http.JSONEncode, svc.Http, cfg._data)
+            if ok then fs.write(FILE, s) end
+        end)
     end
+
     function cfg.get(k, default)
         local v = cfg._data[k]
         return v ~= nil and v or default
     end
+
     function cfg.set(k, v)
         cfg._data[k] = v
         cfg.save()
     end
+
     cfg._data = {}
     cfg.load()
 end
@@ -72,30 +84,9 @@ local ui = loadstring(game:HttpGet(
 ))()
 
 ------------------------------------------------------------------------
--- custom theme (accent = purple, users can change via colorpicker)
+-- saved theme (falls back to Dark)
 ------------------------------------------------------------------------
-local themeAccent = Color3.fromHex("#7c3aed")
-do
-    -- restore saved accent color if it exists
-    local saved = cfg.get("accentColor", nil)
-    if type(saved) == "table" and #saved == 3 then
-        themeAccent = Color3.new(saved[1], saved[2], saved[3])
-    end
-end
-local function applyTheme(accent)
-    ui:AddTheme({
-        Name        = "V1PRWARE",
-        Accent      = accent,
-        Background  = Color3.fromHex("#0d0d0d"),
-        Outline     = Color3.fromHex("#2a2a2a"),
-        Text        = Color3.fromHex("#f4f4f5"),
-        Placeholder = Color3.fromHex("#71717a"),
-        Button      = Color3.fromHex("#27272a"),
-        Icon        = Color3.fromHex("#a1a1aa"),
-    })
-    ui:SetTheme("V1PRWARE")
-end
-applyTheme(themeAccent)
+local savedTheme = cfg.get("windTheme", "Dark")
 
 local win = ui:CreateWindow({
     Title            = "V1PRWARE",
@@ -104,7 +95,7 @@ local win = ui:CreateWindow({
     Folder           = "GlovSakenScript",
     Size             = UDim2.fromOffset(450, 420),
     Transparent      = false,
-    Theme            = "V1PRWARE",
+    Theme            = savedTheme,
     Resizable        = true,
     SideBarWidth     = 160,
     HideSearchBar    = true,
@@ -124,22 +115,6 @@ win:EditOpenButton({
     Enabled         = true,
     Draggable       = true,
 })
-
-------------------------------------------------------------------------
--- WindUI native config (auto-save/load via Flags)
-------------------------------------------------------------------------
-local ConfigManager = win.ConfigManager
-local windCfg = ConfigManager:CreateConfig("v1prware_config")
--- auto-load on start, auto-save whenever any flagged element changes
-task.spawn(function()
-    task.wait(1) -- wait for all elements to register
-    pcall(function() windCfg:Load() end)
-end)
-local _origCfgSet = cfg.set
-cfg.set = function(k, v)
-    _origCfgSet(k, v)
-    pcall(function() windCfg:Save() end)
-end
 
 ------------------------------------------------------------------------
 -- helpers
@@ -175,30 +150,22 @@ end
 local tabSettings = win:Tab({ Title = "Settings", Icon = "settings-2" })
 
 ------------------------------------------------------------------------
--- Appearance section (theme/color)
+-- Appearance section – WindUI built-in themes only
 ------------------------------------------------------------------------
 local secAppearance = tabSettings:Section({ Title = "Appearance", Opened = true })
 
-secAppearance:Colorpicker({
-    Title   = "GUI Accent Color",
-    Desc    = "Changes the highlight/accent color of the GUI",
-    Default = themeAccent,
-    Callback = function(color)
-        themeAccent = color
-        applyTheme(color)
-        cfg.set("accentColor", { color.R, color.G, color.B })
-    end
-})
+local WIND_THEMES = { "Dark", "Light", "Rose", "Plant", "Indigo", "Sky", "Violet", "Amber" }
 
 secAppearance:Dropdown({
-    Title  = "Base Theme",
-    Desc   = "Switch between dark/light base",
-    Values = { "Dark", "Light" },
-    Value  = "Dark",
-    Flag   = "baseTheme",
+    Title    = "Theme",
+    Desc     = "Switch the GUI colour theme",
+    Values   = WIND_THEMES,
+    Value    = savedTheme,
+    Flag     = "windTheme",
     Callback = function(v)
         ui:SetTheme(v)
-    end
+        cfg.set("windTheme", v)
+    end,
 })
 
 local secInterface = tabSettings:Section({ Title = "Interface", Opened = true })
@@ -258,7 +225,7 @@ secInterface:Toggle({
 })
 
 local chatForceEnabled = cfg.get("chatForceEnabled", false)
-local chatForceConn    = nil
+local chatForceConns   = {}
 local function enforceChatOn()
     if not chatForceEnabled then return end
     local cw = svc.TextChat:FindFirstChild("ChatWindowConfiguration")
@@ -270,13 +237,16 @@ secInterface:Toggle({
     Title = "Show Chat Logs", Type = "Checkbox", Flag = "showChatLogs", Default = chatForceEnabled,
     Callback = function(on)
         chatForceEnabled = on; cfg.set("chatForceEnabled", on)
-        if chatForceConn then chatForceConn:Disconnect(); chatForceConn = nil end
+        for _, c in ipairs(chatForceConns) do if c.Connected then c:Disconnect() end end
+        chatForceConns = {}
         if on then
             enforceChatOn()
-            chatForceConn = svc.Run.Heartbeat:Connect(enforceChatOn)
+            -- Only react on property changes — no Heartbeat polling needed
             for _, key in ipairs({ "ChatWindowConfiguration", "ChatInputBarConfiguration" }) do
                 local obj = svc.TextChat:FindFirstChild(key)
-                if obj then obj:GetPropertyChangedSignal("Enabled"):Connect(enforceChatOn) end
+                if obj then
+                    table.insert(chatForceConns, obj:GetPropertyChangedSignal("Enabled"):Connect(enforceChatOn))
+                end
             end
         end
     end
@@ -679,8 +649,13 @@ svc.Run.RenderStepped:Connect(function()
     if not aim.on or not aim.targeting or not aim.hrp or not aim.target then return end
     if not aim.target.Parent then aimUnlock(); return end
     local th=aim.target.Parent:FindFirstChildOfClass("Humanoid"); if not th or th.Health<=0 then aimUnlock(); return end
-    local flat=Vector3.new(aim.target.Position.X-aim.hrp.Position.X,0,aim.target.Position.Z-aim.hrp.Position.Z).Unit
-    if flat.Magnitude>0 then aim.hrp.CFrame=aim.hrp.CFrame:Lerp(CFrame.new(aim.hrp.Position,aim.hrp.Position+flat),aim.smooth) end
+    local dx=aim.target.Position.X-aim.hrp.Position.X
+    local dz=aim.target.Position.Z-aim.hrp.Position.Z
+    local mag=math.sqrt(dx*dx+dz*dz)
+    if mag>0 then
+        local flat=Vector3.new(dx/mag,0,dz/mag)
+        aim.hrp.CFrame=aim.hrp.CFrame:Lerp(CFrame.new(aim.hrp.Position,aim.hrp.Position+flat),aim.smooth)
+    end
 end)
 
 task.spawn(function()
@@ -746,7 +721,10 @@ end
 local function absHookSounds()
     if abs.soundConn then abs.soundConn:Disconnect(); abs.soundConn=nil end
     abs.soundConn=svc.WS.DescendantAdded:Connect(function(obj)
-        if not abs.on or not obj:IsA("Sound") then return end; local id=obj.SoundId:match("%d+"); if id and absTriggerSounds[id] then absTrigger() end
+        -- Early type check before any other work
+        if not abs.on or not obj:IsA("Sound") then return end
+        local id=obj.SoundId:match("%d+")
+        if id and absTriggerSounds[id] then absTrigger() end
     end)
 end
 local function absStartScan()
@@ -797,64 +775,74 @@ end)
 local coolkidWSOOn = cfg.get("coolkidWSOOn", false)
 local function coolkidGetInputDir()
     local cf       = svc.WS.CurrentCamera.CFrame
-    local camFwd   = Vector3.new(cf.LookVector.X,  0, cf.LookVector.Z)
-    local camRight = Vector3.new(cf.RightVector.X, 0, cf.RightVector.Z)
-    local x, z = 0, 0
-    if svc.Input:IsKeyDown(Enum.KeyCode.W) or svc.Input:IsKeyDown(Enum.KeyCode.Up)    then z = z - 1 end
-    if svc.Input:IsKeyDown(Enum.KeyCode.S) or svc.Input:IsKeyDown(Enum.KeyCode.Down)  then z = z + 1 end
-    if svc.Input:IsKeyDown(Enum.KeyCode.A) or svc.Input:IsKeyDown(Enum.KeyCode.Left)  then x = x - 1 end
-    if svc.Input:IsKeyDown(Enum.KeyCode.D) or svc.Input:IsKeyDown(Enum.KeyCode.Right) then x = x + 1 end
-    local dir = camFwd * -z + camRight * x
-    if dir.Magnitude > 0.01 then return dir.Unit end
-    if camFwd.Magnitude > 0.01 then return camFwd.Unit end
-    return Vector3.new(0, 0, -1)
+    local fwd      = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z).Unit
+    local right    = Vector3.new(cf.RightVector.X, 0, cf.RightVector.Z).Unit
+    local dir      = Vector3.zero
+    if svc.Input:IsKeyDown(Enum.KeyCode.W) then dir += fwd  end
+    if svc.Input:IsKeyDown(Enum.KeyCode.S) then dir -= fwd  end
+    if svc.Input:IsKeyDown(Enum.KeyCode.A) then dir -= right end
+    if svc.Input:IsKeyDown(Enum.KeyCode.D) then dir += right end
+    return dir.Magnitude > 0 and dir.Unit or nil
 end
-svc.Run.RenderStepped:Connect(function(dt)
+svc.Run:BindToRenderStep("CoolkidWSO", Enum.RenderPriority.Character.Value + 1, function()
     if not coolkidWSOOn then return end
-    local char = lp.Character
-    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
-    if not char or not hrp then return end
-    if char:GetAttribute("FootstepsMuted") ~= true then return end
-    local dir = coolkidGetInputDir()
-    local lv  = hrp:FindFirstChildWhichIsA("LinearVelocity")
-    if lv then lv.LineDirection = dir end
-    if dir.Magnitude > 0.01 then
-        local targetRot = CFrame.new(hrp.Position, hrp.Position + dir).Rotation
-        hrp.CFrame = CFrame.new(hrp.Position) * hrp.CFrame.Rotation:Lerp(targetRot, math.min(dt * 16, 1))
-    end
+    local char = lp.Character; if not char then return end
+    if char:GetAttribute("PursuitState") ~= "Dashing" then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then return end
+    local inputDir = coolkidGetInputDir()
+    if not inputDir then return end
+    local vel = hrp.AssemblyLinearVelocity
+    local speed = Vector3.new(vel.X, 0, vel.Z).Magnitude
+    if speed < 0.1 then return end
+    hrp.AssemblyLinearVelocity = Vector3.new(inputDir.X * speed, vel.Y, inputDir.Z * speed)
+    hum.WalkSpeed = 60; hum.AutoRotate = false
+    local horiz = Vector3.new(hrp.CFrame.LookVector.X, 0, hrp.CFrame.LookVector.Z)
+    if horiz.Magnitude > 0 then hum:Move(horiz.Unit) end
 end)
 
--- Noli Void Rush
+-- Noli Void Rush Control
 local noliVoidRushOn     = cfg.get("noliVoidRushOn", false)
 local noliOverrideActive = false
 local noliOrigWalkSpeed  = nil
-local noliConn           = nil
-local function noliStop()
-    if not noliOverrideActive then return end
-    noliOverrideActive = false
-    local char = lp.Character
-    local hum  = char and char:FindFirstChild("Humanoid")
-    if hum then hum.WalkSpeed=noliOrigWalkSpeed or 16; hum.AutoRotate=true; pcall(function() hum:Move(Vector3.new(0,0,0)) end) end
-    noliOrigWalkSpeed = nil
-    if noliConn then noliConn:Disconnect(); noliConn = nil end
-end
+local noliOrigAutoRotate = nil
 local function noliStart()
     if noliOverrideActive then return end
     noliOverrideActive = true
-    noliConn = svc.Run.RenderStepped:Connect(function()
-        local char = lp.Character
-        local hum  = char and char:FindFirstChild("Humanoid")
-        local root = char and char:FindFirstChild("HumanoidRootPart")
-        if not hum or not root then return end
-        if not noliOrigWalkSpeed then noliOrigWalkSpeed = hum.WalkSpeed end
-        hum.WalkSpeed=60; hum.AutoRotate=false
-        local horiz = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
-        if horiz.Magnitude > 0 then hum:Move(horiz.Unit) end
+    local char = lp.Character; if not char then return end
+    local hrp  = char:FindFirstChild("HumanoidRootPart")
+    local hum  = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then noliOverrideActive = false; return end
+    noliOrigWalkSpeed  = hum.WalkSpeed
+    noliOrigAutoRotate = hum.AutoRotate
+    svc.Run:BindToRenderStep("NoliVoidRush", Enum.RenderPriority.Character.Value + 3, function()
+        if not noliOverrideActive then svc.Run:UnbindFromRenderStep("NoliVoidRush"); return end
+        local ch2 = lp.Character; if not ch2 then return end
+        local hrp2 = ch2:FindFirstChild("HumanoidRootPart"); local hum2 = ch2:FindFirstChildOfClass("Humanoid")
+        if not hrp2 or not hum2 then return end
+        hum2.WalkSpeed = 60; hum2.AutoRotate = false
+        local horiz = Vector3.new(hrp2.CFrame.LookVector.X, 0, hrp2.CFrame.LookVector.Z)
+        if horiz.Magnitude > 0 then hum2:Move(horiz.Unit) end
     end)
 end
-svc.Run.RenderStepped:Connect(function()
-    if not noliVoidRushOn then if noliOverrideActive then noliStop() end; return end
+local function noliStop()
+    if not noliOverrideActive then return end
+    noliOverrideActive = false
+    svc.Run:UnbindFromRenderStep("NoliVoidRush")
     local char = lp.Character; if not char then return end
+    local hum  = char:FindFirstChildOfClass("Humanoid"); if not hum then return end
+    if noliOrigWalkSpeed  ~= nil then hum.WalkSpeed  = noliOrigWalkSpeed  end
+    if noliOrigAutoRotate ~= nil then hum.AutoRotate = noliOrigAutoRotate end
+    noliOrigWalkSpeed = nil; noliOrigAutoRotate = nil
+end
+svc.Run.RenderStepped:Connect(function()
+    if not noliVoidRushOn then
+        if noliOverrideActive then noliStop() end
+        return
+    end
+    local char = lp.Character; if not char then return end
+    -- Only read attribute when we need to — avoids Roblox API overhead when inactive
     if char:GetAttribute("VoidRushState") == "Dashing" then noliStart() else noliStop() end
 end)
 lp.CharacterAdded:Connect(function() noliStop(); noliOrigWalkSpeed = nil end)
@@ -865,328 +853,11 @@ secKillerAbilities:Toggle({ Title="c00lkidd — Dash Turn",     Type="Checkbox",
 secKillerAbilities:Toggle({ Title="Noli — Void Rush Control", Type="Checkbox", Default=noliVoidRushOn,Callback=function(on) noliVoidRushOn=on; cfg.set("noliVoidRushOn",on); if not on then noliStop() end end })
 
 ------------------------------------------------------------------------
--- Taph Subspace TP
 ------------------------------------------------------------------------
-local secTaph = tabKiller:Section({ Title = "Taph — Subspace TP", Opened = true })
-
-do
-    local taphConn = nil
-    local taphEnabled = false
-
-    local function createBuf()
-        local b = buffer.create(8)
-        buffer.writeu32(b, 0, 0xb418bda4)
-        buffer.writeu32(b, 4, 0x8a009234)
-        return b
-    end
-
-    local function getRemote()
-        return svc.RS
-            :WaitForChild("Modules", 5)
-            :WaitForChild("Network", 5)
-            :WaitForChild("Network", 5)
-            :WaitForChild("RemoteEvent", 5)
-    end
-
-    local function getKillerHRP()
-        local players = svc.WS:FindFirstChild("Players")
-        if not players then return nil end
-        local killers = players:FindFirstChild("Killers") or players:FindFirstChild("killers-killer")
-        if not killers then return nil end
-        for _, model in ipairs(killers:GetChildren()) do
-            local hrp = model:FindFirstChild("HumanoidRootPart")
-            if hrp then return hrp end
-        end
-        return nil
-    end
-
-    local function doSubspaceTP()
-        local remote = pcall(getRemote) and getRemote() or nil
-        if not remote then return end
-
-        local killerHRP = getKillerHRP()
-        if not killerHRP then return end
-
-        -- fire UseActorAbility to trigger the subspace mine
-        remote:FireServer("UseActorAbility", { createBuf() })
-
-        -- wait a tick then warp the mine instance to the killer
-        task.wait(0.08)
-        local mine = nil
-        -- look for the tripmine/subspace object in workspace
-        for _, v in ipairs(svc.WS:GetDescendants()) do
-            local n = v.Name:lower()
-            if (n:find("tripmine") or n:find("subspace") or n:find("mine")) and v:IsA("BasePart") then
-                mine = v
-                break
-            end
-        end
-        if mine then
-            mine.Position = killerHRP.Position
-        end
-    end
-
-    secTaph:Toggle({
-        Title    = "Taph Subspace TP",
-        Desc     = "Auto-teleports the Subspace Tripmine to the killer on use",
-        Type     = "Checkbox",
-        Default  = false,
-        Callback = function(on)
-            taphEnabled = on
-            cfg.set("taphSubspaceTP", on)
-            if taphConn then taphConn:Disconnect(); taphConn = nil end
-            if on then
-                -- hook: watch for the ability being fired via remote
-                local ok, remote = pcall(getRemote)
-                if ok and remote then
-                    taphConn = remote.OnClientEvent:Connect(function(action)
-                        if taphEnabled and action == "UseActorAbility" then
-                            task.spawn(doSubspaceTP)
-                        end
-                    end)
-                end
-            end
-        end
-    })
-
-    secTaph:Button({
-        Title    = "Fire Now (Test)",
-        Desc     = "Manually trigger the Subspace TP once",
-        Callback = function()
-            task.spawn(doSubspaceTP)
-        end
-    })
-end
-
-------------------------------------------------------------------------
--- Noli — Heli-Tech Macro
-------------------------------------------------------------------------
-local secHeli = tabKiller:Section({ Title = "Noli — Heli-Tech Macro", Opened = false })
-
-do
-    local heli = {
-        enabled  = cfg.get("heliEnabled", false),
-        strength = cfg.get("heliStrength", 95),
-        holdTime = cfg.get("heliHoldTime", 0.33),
-        remote   = nil,
-        isActive = false,
-    }
-
-    pcall(function()
-        heli.remote = svc.RS
-            :WaitForChild("Modules", 5)
-            :WaitForChild("Network", 5)
-            :WaitForChild("Network", 5)
-            :WaitForChild("RemoteEvent", 5)
-    end)
-
-    local function heliFireVoidRush()
-        if not heli.remote then return end
-        local b = buffer.create(8)
-        buffer.writeu32(b, 0, math.random(0, 0xFFFFFFFF))
-        buffer.writeu32(b, 4, math.random(0, 0xFFFFFFFF))
-        heli.remote:FireServer("UseActorAbility", { b })
-    end
-
-    local function performHeliLaunch()
-        if heli.isActive then return end
-        heli.isActive = true
-        task.spawn(function()
-            local char = lp.Character
-            local hrp  = char and char:FindFirstChild("HumanoidRootPart")
-            local hum  = char and char:FindFirstChildOfClass("Humanoid")
-            if not hrp or not hum then heli.isActive = false return end
-
-            hum.WalkSpeed = 60
-            hum:Move(hrp.CFrame.LookVector, true)
-            task.wait(0.07)
-            hrp.AssemblyLinearVelocity = hrp.AssemblyLinearVelocity - hrp.CFrame.LookVector * 14
-
-            local cam = svc.WS.CurrentCamera
-            if cam then cam.CFrame = cam.CFrame * CFrame.Angles(math.rad(-13), 0, 0) end
-
-            task.wait(math.random(65, 115) / 1000)
-            heliFireVoidRush()
-            task.wait(0.04)
-
-            if hrp then
-                hrp.AssemblyLinearVelocity = hrp.AssemblyLinearVelocity
-                    + hrp.CFrame.LookVector * heli.strength
-                    + Vector3.new(0, 50, 0)
-            end
-
-            task.wait(heli.holdTime)
-            heli.isActive = false
-        end)
-    end
-
-    svc.RS:WaitForChild("Network", 999) -- lazy guard
-    svc.Run.RenderStepped:Connect(function()
-        if not heli.enabled then return end
-        local char = lp.Character
-        if not char then return end
-        local vrState  = char:GetAttribute("VoidRushState")
-        local pursuit  = char:GetAttribute("PursuitState")
-        local isSecond = (vrState == "Dashing" or vrState == "Rerush" or vrState == "SecondDash")
-            or (pursuit == "Dashing" and char:GetAttribute("VoidRushCharge") == 0)
-        if isSecond and not heli.isActive then performHeliLaunch() end
-    end)
-
-    svc.UIS.InputBegan:Connect(function(input, gpe)
-        if gpe or not heli.enabled then return end
-        if input.KeyCode == Enum.KeyCode.H then performHeliLaunch() end
-    end)
-
-    secHeli:Toggle({
-        Title    = "Enable Heli-Tech Macro",
-        Desc     = "Auto-triggers on 2nd Void Rush. Manual: H key",
-        Type     = "Checkbox",
-        Default  = heli.enabled,
-        Callback = function(on) heli.enabled = on; cfg.set("heliEnabled", on) end
-    })
-    secHeli:Slider({
-        Title    = "Launch Strength",
-        Desc     = "Higher = more air distance (50–160)",
-        Step     = 1,
-        Value    = { Min = 50, Max = 160, Default = heli.strength },
-        Callback = function(v) heli.strength = v; cfg.set("heliStrength", v) end
-    })
-    secHeli:Slider({
-        Title    = "Hold Time (s)",
-        Desc     = "How long to hold the boost (0.15–0.65)",
-        Step     = 0.01,
-        Value    = { Min = 0.15, Max = 0.65, Default = heli.holdTime },
-        Callback = function(v) heli.holdTime = v; cfg.set("heliHoldTime", v) end
-    })
-    secHeli:Button({
-        Title    = "Test Heli-Tech Now",
-        Callback = function() performHeliLaunch() end
-    })
-end
-
-------------------------------------------------------------------------
--- Noli — Nova Silent Aim
-------------------------------------------------------------------------
-local secNova = tabKiller:Section({ Title = "Noli — Nova Silent Aim", Opened = false })
-
-do
-    local nova = {
-        enabled    = cfg.get("novaAimEnabled", false),
-        prediction = cfg.get("novaAimPred", 0.55),
-        offsetY    = cfg.get("novaAimOffsetY", -0.4),
-        networkRF  = nil,
-        patched    = false,
-        origCB     = nil,
-    }
-
-    pcall(function()
-        nova.networkRF = svc.RS
-            :WaitForChild("Modules", 5)
-            :WaitForChild("Network", 5)
-            :WaitForChild("Network", 5)
-            :WaitForChild("RemoteFunction", 5)
-    end)
-
-    local function isNoli()
-        local char = lp.Character
-        if not char then return false end
-        local killers = svc.WS:FindFirstChild("Players") and svc.WS.Players:FindFirstChild("Killers")
-        return killers and char:IsDescendantOf(killers) and char.Name:lower():find("noli")
-    end
-
-    local function getNearestSurvivor(fromPos)
-        local survivors = svc.WS:FindFirstChild("Players") and svc.WS.Players:FindFirstChild("Survivors")
-        if not survivors then return nil end
-        local nearest, best = nil, math.huge
-        for _, model in ipairs(survivors:GetChildren()) do
-            local hrp = model:FindFirstChild("HumanoidRootPart")
-            local hum = model:FindFirstChildOfClass("Humanoid")
-            if hrp and hum and hum.Health > 0 then
-                local d = (hrp.Position - fromPos).Magnitude
-                if d < best then best = d; nearest = hrp end
-            end
-        end
-        return nearest
-    end
-
-    local function buildSilentCamCF(myHRP, targetHRP)
-        if not myHRP or not targetHRP then return nil end
-        local spawnPos = myHRP.Position + Vector3.new(0, 2, 0)
-        local predicted = targetHRP.Position + (targetHRP.AssemblyLinearVelocity * nova.prediction)
-        local targetPos = predicted + Vector3.new(0, nova.offsetY, 0)
-        local delta = targetPos - spawnPos
-        local flat  = Vector3.new(delta.X, 0, delta.Z)
-        if flat.Magnitude < 0.01 then return nil end
-        local v0, g = 250, 40
-        local v2   = v0 * v0
-        local disc = v2 * v2 - g * (g * flat.Magnitude * flat.Magnitude + 2 * delta.Y * v2)
-        local theta = disc < 0
-            and math.atan2(delta.Y, flat.Magnitude)
-            or  math.atan2(v2 - math.sqrt(disc), g * flat.Magnitude)
-        local T     = math.tan(theta)
-        local alpha = math.abs(3 + T) < 0.0001 and -math.pi/2 or math.atan2(3*T - 1, 3 + T)
-        local cam   = svc.WS.CurrentCamera
-        local yawCF = CFrame.lookAt(cam.CFrame.Position, cam.CFrame.Position + flat.Unit)
-        return yawCF * CFrame.Angles(alpha, 0, 0)
-    end
-
-    local function applyNovaAim()
-        if nova.patched or not nova.networkRF then return end
-        nova.origCB = nova.networkRF.OnClientInvoke
-        nova.networkRF.OnClientInvoke = function(req, ...)
-            if req == "GetCameraCF" and nova.enabled and isNoli() then
-                local char  = lp.Character
-                local myHRP = char and char:FindFirstChild("HumanoidRootPart")
-                if myHRP then
-                    local target = getNearestSurvivor(myHRP.Position)
-                    if target then
-                        local cf = buildSilentCamCF(myHRP, target)
-                        if cf then return cf end
-                    end
-                end
-            end
-            if nova.origCB then return nova.origCB(req, ...) end
-        end
-        nova.patched = true
-    end
-
-    secNova:Toggle({
-        Title    = "Enable Nova Silent Aim",
-        Desc     = "Redirects Nova throws to nearest survivor. Noli only",
-        Type     = "Checkbox",
-        Default  = nova.enabled,
-        Callback = function(on)
-            nova.enabled = on
-            cfg.set("novaAimEnabled", on)
-            if on then applyNovaAim() end
-        end
-    })
-    secNova:Slider({
-        Title    = "Prediction",
-        Desc     = "Lead amount on moving targets (0–2)",
-        Step     = 0.01,
-        Value    = { Min = 0, Max = 2, Default = nova.prediction },
-        Callback = function(v) nova.prediction = v; cfg.set("novaAimPred", v) end
-    })
-    secNova:Slider({
-        Title    = "Aim Offset Y",
-        Desc     = "Vertical adjustment (-5 to 5)",
-        Step     = 0.1,
-        Value    = { Min = -5, Max = 5, Default = nova.offsetY },
-        Callback = function(v) nova.offsetY = v; cfg.set("novaAimOffsetY", v) end
-    })
-    secNova:Paragraph({
-        Title   = "Note",
-        Content = "Only activates when you are playing as Noli (killer). Silent aim hooks the camera CF request the server sends.",
-    })
-end
-
+-- TAB: VISUAL (ESP) — full professional rewrite
 ------------------------------------------------------------------------
 ------------------------------------------------------------------------
--- TAB: VISUAL (ESP)
-------------------------------------------------------------------------
-------------------------------------------------------------------------
-local tabVisual = win:Tab({ Title = "Visual", Icon = "eye-off" })
+local tabVisual = win:Tab({ Title = "Visual", Icon = "eye" })
 local secESP    = tabVisual:Section({ Title = "ESP", Opened = true })
 
 local esp = {
@@ -1241,7 +912,7 @@ espAttach = function(obj, tag, color, isChar)
             local hum=obj:FindFirstChildOfClass("Humanoid")
             if hum then
                 lbl.Text=obj.Name.." (100%)"
-                local c=hum.HealthChanged:Connect(function() if lbl.Parent then lbl.Text=obj.Name.." ("..math.floor(hum.Health/hum.MaxHealth*100).."%)" end end)
+                local c=hum.HealthChanged:Connect(function() if lbl.Parent then lbl.Text=obj.Name.." ("..math.floor(hum.Health/hum.MaxHealth*100).."%)"; end end)
                 esp.healthConns[obj]=c
             else lbl.Text=obj.Name end
         else
@@ -1337,14 +1008,14 @@ local function espBindWorld()
     local existing=getMapContent(); if existing then esp.mapFolder=existing; task.spawn(function() task.wait(2); if esp.generators then espDoGenerators(true) end; if esp.items then espDoItems(true) end end) end
 end
 
-secESP:Toggle({ Title="Killers",    Type="Checkbox", Flag = "espKillers", Default=esp.killers,    Callback=function(on) esp.killers=on;    cfg.set("espKillers",on);    task.spawn(function() espDoKillers(on)    end) end })
-secESP:Toggle({ Title="Survivors",  Type="Checkbox", Flag = "espSurvivors", Default=esp.survivors,  Callback=function(on) esp.survivors=on;  cfg.set("espSurvivors",on);  task.spawn(function() espDoSurvivors(on)  end) end })
-secESP:Toggle({ Title="Generators", Type="Checkbox", Flag = "espGenerators", Default=esp.generators, Callback=function(on) esp.generators=on; cfg.set("espGenerators",on); task.spawn(function() espDoGenerators(on) end) end })
-secESP:Toggle({ Title="Items",      Type="Checkbox", Flag = "espItems", Default=esp.items,      Callback=function(on) esp.items=on;      cfg.set("espItems",on);      task.spawn(function() espDoItems(on)      end) end })
-secESP:Toggle({ Title="Buildings",  Type="Checkbox", Flag = "espBuildings", Default=esp.buildings,  Callback=function(on) esp.buildings=on;  cfg.set("espBuildings",on);  task.spawn(function() espDoBuildings(on)  end) end })
+secESP:Toggle({ Title="Killers",    Type="Checkbox", Default=esp.killers,    Callback=function(on) esp.killers=on;    cfg.set("espKillers",on);    task.spawn(function() espDoKillers(on)    end) end })
+secESP:Toggle({ Title="Survivors",  Type="Checkbox", Default=esp.survivors,  Callback=function(on) esp.survivors=on;  cfg.set("espSurvivors",on);  task.spawn(function() espDoSurvivors(on)  end) end })
+secESP:Toggle({ Title="Generators", Type="Checkbox", Default=esp.generators, Callback=function(on) esp.generators=on; cfg.set("espGenerators",on); task.spawn(function() espDoGenerators(on) end) end })
+secESP:Toggle({ Title="Items",      Type="Checkbox", Default=esp.items,      Callback=function(on) esp.items=on;      cfg.set("espItems",on);      task.spawn(function() espDoItems(on)      end) end })
+secESP:Toggle({ Title="Buildings",  Type="Checkbox", Default=esp.buildings,  Callback=function(on) esp.buildings=on;  cfg.set("espBuildings",on);  task.spawn(function() espDoBuildings(on)  end) end })
 
 ------------------------------------------------------------------------
--- Minion + Puddle ESP
+-- Minion + Puddle ESP (unchanged logic, updated style)
 ------------------------------------------------------------------------
 local secMinion = tabVisual:Section({ Title = "Minion & Ability ESP", Opened = true })
 local mset = { pizza=cfg.get("espPizza",false), zombie=cfg.get("espZombie",false), puddle=cfg.get("espPuddle",false), transparency=cfg.get("espMinionTrans",0.25) }
@@ -1369,8 +1040,8 @@ local function addHighlight(obj, color, tag, label, offset)
     local hl = Instance.new("Highlight")
     hl.Name=tag.."_HL"; hl.FillColor=color; hl.FillTransparency=mset.transparency; hl.OutlineColor=color; hl.OutlineTransparency=0.1; hl.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop; hl.Adornee=obj; hl.Parent=obj
     if root then
-        local bb = Instance.new("BillboardGui"); bb.Name=tag.."_BB"; bb.Adornee=root; bb.Size=UDim2.new(0,130,0,24); bb.StudsOffset=Vector3.new(0,offset or 3,0); bb.AlwaysOnTop=true; bb.Parent=obj
-        local lbl = Instance.new("TextLabel"); lbl.Size=UDim2.new(1,0,1,0); lbl.BackgroundTransparency=1; lbl.Text=label; lbl.TextColor3=color; lbl.TextStrokeColor3=Color3.new(0,0,0); lbl.TextStrokeTransparency=0.2; lbl.TextSize=12; lbl.Font=Enum.Font.GothamBold; lbl.Parent=bb
+        local bb = Instance.new("BillboardGui"); bb.Name=tag.."_BB"; bb.Adornee=root; bb.Size=UDim2.new(0,140,0,26); bb.StudsOffset=Vector3.new(0,offset or 3,0); bb.AlwaysOnTop=true; bb.Parent=obj
+        local lbl = Instance.new("TextLabel"); lbl.Size=UDim2.new(1,0,1,0); lbl.BackgroundTransparency=1; lbl.Text=label; lbl.TextColor3=color; lbl.TextStrokeColor3=Color3.new(0,0,0); lbl.TextStrokeTransparency=0.25; lbl.TextSize=12; lbl.Font=Enum.Font.GothamBold; lbl.Parent=bb
     end
     local conn; conn = obj.AncestryChanged:Connect(function()
         if obj.Parent then return end; conn:Disconnect(); hl:Destroy()
@@ -1400,7 +1071,7 @@ local function addPuddleHighlight(part, color, tag, label)
     local holder=Instance.new("Part"); holder.Name="PuddleHolder"; holder.Size=Vector3.new(1,0.1,1); holder.Transparency=1; holder.CanCollide=false; holder.Anchored=true; holder.Position=part.Position+Vector3.new(0,0.05,0); holder.Parent=part
     local blackCircle=Instance.new("CylinderHandleAdornment"); blackCircle.Name="PuddleBlack"; blackCircle.Adornee=holder; blackCircle.Color3=Color3.fromRGB(0,0,0); blackCircle.Transparency=0.2; blackCircle.Radius=radius; blackCircle.Height=0.02; blackCircle.CFrame=CFrame.Angles(math.rad(90),0,0); blackCircle.ZIndex=5; blackCircle.AlwaysOnTop=true; blackCircle.Parent=holder
     local redOutline=Instance.new("CylinderHandleAdornment"); redOutline.Name="PuddleRed"; redOutline.Adornee=holder; redOutline.Color3=Color3.fromRGB(255,0,0); redOutline.Transparency=0.4; redOutline.Radius=radius+0.8; redOutline.Height=0.02; redOutline.CFrame=CFrame.Angles(math.rad(90),0,0); redOutline.ZIndex=4; redOutline.AlwaysOnTop=true; redOutline.Parent=holder
-    local bb=Instance.new("BillboardGui"); bb.Name=tag.."_BB"; bb.Adornee=holder; bb.Size=UDim2.new(0,140,0,20); bb.StudsOffset=Vector3.new(0,1.5,0); bb.AlwaysOnTop=true; bb.Parent=holder
+    local bb=Instance.new("BillboardGui"); bb.Name=tag.."_BB"; bb.Adornee=holder; bb.Size=UDim2.new(0,150,0,22); bb.StudsOffset=Vector3.new(0,1.5,0); bb.AlwaysOnTop=true; bb.Parent=holder
     local lbl=Instance.new("TextLabel"); lbl.Size=UDim2.new(1,0,1,0); lbl.BackgroundTransparency=1; lbl.Text=label; lbl.TextColor3=Color3.fromRGB(255,255,255); lbl.TextStrokeColor3=Color3.fromRGB(255,0,0); lbl.TextStrokeTransparency=0.1; lbl.TextSize=11; lbl.Font=Enum.Font.GothamBold; lbl.Parent=bb
     local sizeConn; sizeConn=part:GetPropertyChangedSignal("Size"):Connect(function()
         if not part.Parent then sizeConn:Disconnect(); return end
@@ -1439,6 +1110,9 @@ local function setupMinionWatcher()
     end)
 end
 
+------------------------------------------------------------------------
+-- ESP refresh loop
+------------------------------------------------------------------------
 task.spawn(function()
     while true do
         task.wait(3)
@@ -1451,11 +1125,13 @@ task.spawn(function()
     end
 end)
 
+-- initial setup after world loads
 task.spawn(function()
     task.wait(3)
-    local pf=svc.WS:FindFirstChild("Players")
+    local pf = svc.WS:FindFirstChild("Players")
     if pf then
-        esp.killerFolder=pf:FindFirstChild("Killers"); esp.survivorFolder=pf:FindFirstChild("Survivors")
+        esp.killerFolder   = pf:FindFirstChild("Killers")
+        esp.survivorFolder = pf:FindFirstChild("Survivors")
         espBindPlayers()
         if esp.killers   then task.spawn(function() espDoKillers(true)   end) end
         if esp.survivors then task.spawn(function() espDoSurvivors(true) end) end
@@ -1466,7 +1142,7 @@ task.spawn(function()
     if mset.pizza  then scanPizza()   end
     if mset.zombie then scanZombie()  end
     if mset.puddle then scanPuddles() end
-    esp.ready=true
+    esp.ready = true
 end)
 
 lp.CharacterAdded:Connect(function()
@@ -1564,7 +1240,6 @@ lp.CharacterAdded:Connect(function() task.wait(3); if music.on then if music.thr
 ------------------------------------------------------------------------
 ------------------------------------------------------------------------
 -- TAB: SURVIVORS / SENTINELS
--- (replaces the old Character tab — all scripts integrated inline)
 ------------------------------------------------------------------------
 ------------------------------------------------------------------------
 local tabSurSen = win:Tab({ Title = "Sentinels", Icon = "shield" })
@@ -1605,7 +1280,6 @@ do
     if lp.Character then elliotSetupChar(lp.Character) end
     lp.CharacterAdded:Connect(function(c) elliotSetupChar(c) end)
 
-    -- Hook remote for throw detection
     task.spawn(function()
         local ok, re = pcall(function()
             return svc.RS:WaitForChild("Modules",5):WaitForChild("Network",5):WaitForChild("RemoteEvent",5)
@@ -1708,8 +1382,13 @@ do
         return pts
     end
 
+    local _elliotLastArcUpdate = 0
     local function elliotUpdateArc(tgt)
         if not elliotShowArc or not elliotHRP then elliotClearArc(); return end
+        -- Throttle arc geometry rebuild to ~10 fps (every 0.1s) — avoids creating/destroying parts every frame
+        local now = tick()
+        if now - _elliotLastArcUpdate < 0.1 then return end
+        _elliotLastArcUpdate = now
         local char = lp.Character
         local lArm = char and (char:FindFirstChild("Left Arm") or char:FindFirstChild("LeftHand") or char:FindFirstChild("LeftLowerArm"))
         local startPos = lArm and lArm.Position or (elliotHRP.Position + Vector3.new(-1,1,0) + elliotHRP.CFrame.LookVector*2)
@@ -1762,14 +1441,15 @@ do
             elliotClearArc()
         end
     end })
-
 end
 
 ------------------------------------------------------------------------
--- SECTION: SENTINELS (all integrated inline)
+-- SECTION: SENTINELS
 ------------------------------------------------------------------------
 local secSentinels = tabSurSen:Section({ Title = "Sentinels", Opened = true })
 
+secSentinels:Button({ Title="Guest1337",
+    Callback=function() loadstring(game:HttpGet("https://pastebin.com/raw/Kx5U4bLL"))() end })
 
 -- ──────────────────────────────────────────────
 -- CHANCE AIMBOT (inline)
@@ -1803,7 +1483,7 @@ do
         Builderman={walk=8.5,run=27.5}, Dusekkar={walk=8,run=27.5},
     }
 
-    local chanceHum, chanceHRP
+    local chanceHum, chanceHRP, chanceBodyGyro, chanceSavedAutoRotate
     local function chanceSetChar(c) chanceHum=c:WaitForChild("Humanoid"); chanceHRP=c:WaitForChild("HumanoidRootPart") end
     if lp.Character then chanceSetChar(lp.Character) end
     lp.CharacterAdded:Connect(chanceSetChar)
@@ -1819,11 +1499,18 @@ do
     end
 
     local chancePingSamples={}
+    local _chanceLastPingTime=0
+    local _chanceLastPingVal=0.1
     local function chanceGetPing()
+        local now=tick()
+        if now-_chanceLastPingTime<1 then return _chanceLastPingVal end
+        _chanceLastPingTime=now
         local ok,stat=pcall(function() return svc.Stats.Network.ServerStatsItem["Data Ping"]:GetValue() end)
         local raw=(ok and stat or 100)/1000
         table.insert(chancePingSamples,raw); if #chancePingSamples>5 then table.remove(chancePingSamples,1) end
-        local s=0; for _,v in ipairs(chancePingSamples) do s=s+v end; return s/#chancePingSamples
+        local s=0; for _,v in ipairs(chancePingSamples) do s=s+v end
+        _chanceLastPingVal=s/#chancePingSamples
+        return _chanceLastPingVal
     end
 
     local function chanceGetNearest()
@@ -1864,7 +1551,6 @@ do
         return pos+vel*lead+ac
     end
 
-    -- Hook animator for mobile/auto mode
     local function chanceHookAnimator(char)
         local hum=char:WaitForChild("Humanoid"); local anim=hum:WaitForChild("Animator")
         local chanceTriggers={["133607163653602"]=true,["133491532453922"]=true,["131189930305001"]=true,["111384272984267"]=true,["103601716322988"]=true,["76649505662612"]=true}
@@ -1872,6 +1558,11 @@ do
             if not chanceAimEnabled or chanceHoldToAim then return end
             local id=track.Animation.AnimationId:match("%d+")
             if id and chanceTriggers[id] then
+                -- Save AutoRotate and disable it
+                if chanceHum then
+                    chanceSavedAutoRotate = chanceHum.AutoRotate
+                    chanceHum.AutoRotate = false
+                end
                 chanceAiming=true; chanceStartTime=tick()
                 if chanceMsgOnAim and chanceMsgText~="" then
                     local ch=svc.TextChat.TextChannels.RBXGeneral
@@ -1881,6 +1572,18 @@ do
                     local a=Instance.new("Animation"); a.AnimationId="rbxassetid://"..chanceCustomAnimID
                     hum.Animator:LoadAnimation(a):Play()
                 end
+                -- Restore AutoRotate when track ends
+                track.Ended:Connect(function()
+                    if chanceHum and chanceSavedAutoRotate ~= nil then
+                        chanceHum.AutoRotate = chanceSavedAutoRotate
+                    end
+                    -- Clean up BodyGyro
+                    if chanceBodyGyro and chanceBodyGyro.Parent then
+                        chanceBodyGyro:Destroy()
+                        chanceBodyGyro = nil
+                    end
+                    chanceAiming = false
+                end)
             end
         end)
     end
@@ -1909,11 +1612,16 @@ do
                 return
             end
         end
+        -- Use BodyGyro for smooth aim
+        if not chanceBodyGyro or not chanceBodyGyro.Parent then
+            chanceBodyGyro = Instance.new("BodyGyro")
+            chanceBodyGyro.MaxTorque = Vector3.new(0, math.huge, 0)
+            chanceBodyGyro.P = 10000
+            chanceBodyGyro.D = 500
+            chanceBodyGyro.Parent = chanceHRP
+        end
         local goalCF=CFrame.lookAt(chanceHRP.Position,aimPos)
-        local isMoving=chanceHRP.AssemblyLinearVelocity.Magnitude>0.5
-        local spd=isMoving and math.max(chanceSmoothSpeed,20) or chanceSmoothSpeed
-        local alpha=1-math.exp(-spd*dt)
-        chanceHRP.CFrame=chanceHRP.CFrame:Lerp(goalCF,alpha)
+        chanceBodyGyro.CFrame = goalCF
     end)
 
     chanceSection:Toggle({ Title="Enable Aimbot", Value=false, Callback=function(v) chanceAimEnabled=v end })
@@ -1948,23 +1656,50 @@ end
 do
     local bsSection = tabSurSen:Section({ Title = "TwoTime Backstab", Opened = false })
 
-    local BS_DEFAULT_PROXIMITY  = 8
-    local BS_DEFAULT_DURATION   = 0.6
-    local BS_BEHIND_DISTANCE    = 3.5
-    local BS_CHECK_INTERVAL     = 0.06
-    local BS_COOLDOWN           = 5
-    local BS_LERP_SPEED         = 0.37
-    local BS_REMOTE_FIRE_DELAY  = 0.0
-    local BS_AIM_SNAP_DELAY     = 0.25
+    ----------------------------------------------------------------
+    -- CONSTANTS (sourced directly from TwoTime Behavior + Config)
+    ----------------------------------------------------------------
 
-    local bsRunning      = true
-    local bsEnabled      = false
-    local bsDaggerEnabled= false
-    local bsRangeMode    = "Behind"
-    local bsBackstabType = "Aim"
-    local bsProximity    = BS_DEFAULT_PROXIMITY
-    local bsLastTrigger  = 0
-    local bsAimRefCount  = 0
+    -- Both backstab angle thresholds are 70 degrees (Config: DaggerBackstabThreshold
+    -- and DaggerLookDirectionAngle). Precompute cosine for dot-product comparisons.
+    local BS_BACKSTAB_THRESHOLD_COS = math.cos(math.rad(70))   -- ≈ 0.342
+
+    -- Server windup delay before hitbox + lunge activate (Behavior: task.delay(0.3, ...))
+    local BS_SERVER_WINDUP          = 0.30   -- seconds
+
+    -- Hitbox active window (Behavior: v_u_48 = crouching and 0.415 or 0.25)
+    local BS_HITBOX_TIME_UNCROUCHED = 0.25   -- seconds
+
+    ----------------------------------------------------------------
+    -- USER-TUNABLE CONFIG
+    ----------------------------------------------------------------
+
+    local BS_DEFAULT_PROXIMITY  = 8
+    local BS_DASH_FLIP_DELAY    = 0.38   -- SERVER_WINDUP + ~80ms avg ping
+    local BS_LUNGE_HOLD_DURATION= BS_HITBOX_TIME_UNCROUCHED  -- 0.25s
+    local BS_DEPTH_OFFSET       = 2.0    -- studs forward nudge at flip moment
+    local BS_LERP_SPEED         = 0.37 * 1.6
+    local BS_AIM_SNAP_DELAY     = 0.25
+    local BS_CHECK_INTERVAL     = 0.05
+    local BS_COOLDOWN           = 5.0
+
+    -- State
+    local bsRunning         = true
+    local bsEnabled         = false
+    local bsDaggerEnabled   = false
+    local bsMode            = "Auto Backstab"
+    local bsBaseProximity   = BS_DEFAULT_PROXIMITY
+    local bsSuppressCallback= false
+    local bsLastTrigger     = 0
+    local bsAimRefCount     = 0
+
+    -- Killer speed tracking
+    local BS_SPRINT_THRESHOLD   = 26.7
+    local BS_RANGE_SPRINT_BONUS = 10
+    local bsKillerSpeedCache    = {}
+    local bsKillerSprintLatch   = {}
+    local bsLastDisplayedRange  = BS_DEFAULT_PROXIMITY
+    local bsDetectionRangeSlider= nil
 
     local function bsGetChar() return lp.Character or lp.CharacterAdded:Wait() end
 
@@ -2023,7 +1758,25 @@ do
         local hum=char:FindFirstChildWhichIsA("Humanoid")
         if hum then pcall(function() hum.AutoRotate=val end) end
     end
-    local function bsActivateForKiller(killerModel, duration)
+
+    local function bsGetKillerSpeed(killer)
+        local khrp=killer:FindFirstChild("HumanoidRootPart"); if not khrp then return 0 end
+        local now=os.clock(); local cache=bsKillerSpeedCache[killer]; local speed=0
+        if cache then
+            local dt=now-cache.t
+            if dt>0 then
+                local dp=khrp.Position-cache.pos
+                speed=Vector3.new(dp.X,0,dp.Z).Magnitude/dt
+            end
+        end
+        bsKillerSpeedCache[killer]={pos=khrp.Position,t=now}
+        return speed
+    end
+
+    ----------------------------------------------------------------
+    -- Auto Backstab — Aim mode
+    ----------------------------------------------------------------
+    local function bsAimAtKiller(killerModel, duration)
         if not killerModel or not bsRunning then return end
         local char=bsGetChar(); local hum=char and char:FindFirstChildWhichIsA("Humanoid")
         local hrp=char and char:FindFirstChild("HumanoidRootPart"); local khrp=killerModel:FindFirstChild("HumanoidRootPart")
@@ -2034,96 +1787,265 @@ do
             bsAimRefCount=math.max(0,bsAimRefCount-1)
             if bsAimRefCount==0 then bsSetAutoRotate(true) end
         end
-        local function computeCF()
-            local kCF=khrp.CFrame; local behindPos=kCF.Position-(kCF.LookVector.Unit*BS_BEHIND_DISTANCE)
-            behindPos=Vector3.new(behindPos.X,kCF.Position.Y,behindPos.Z)
-            return CFrame.new(behindPos,behindPos+kCF.LookVector.Unit)
-        end
-        if bsBackstabType=="Lerp" then
-            local t0=os.clock(); local conn
-            conn=svc.Run.Heartbeat:Connect(function()
-                if not bsRunning or os.clock()-t0>=duration then conn:Disconnect(); finish(); return end
-                if khrp and hrp then hrp.CFrame=hrp.CFrame:Lerp(computeCF(),BS_LERP_SPEED) end
-            end)
-        elseif bsBackstabType=="Teleport" then
-            local t0=os.clock(); local conn
-            conn=svc.Run.Heartbeat:Connect(function()
-                if not bsRunning or os.clock()-t0>=duration then conn:Disconnect(); finish(); return end
-                if khrp and hrp then hrp.CFrame=computeCF() end
-            end)
-        elseif bsBackstabType=="Aim" then
-            local t0=os.clock(); local conn
-            conn=svc.Run.Heartbeat:Connect(function()
-                if not bsRunning or os.clock()-t0>=duration then conn:Disconnect(); finish(); return end
-                if khrp and hrp then
-                    local tp=Vector3.new(khrp.Position.X,hrp.Position.Y,khrp.Position.Z)
-                    hrp.CFrame=hrp.CFrame:Lerp(CFrame.new(hrp.Position,tp),BS_LERP_SPEED*1.6)
+        local t0=os.clock(); local conn
+        conn=svc.Run.Heartbeat:Connect(function()
+            if not bsRunning or os.clock()-t0>=duration then conn:Disconnect(); finish(); return end
+            if khrp and hrp then
+                local tgt=Vector3.new(khrp.Position.X,hrp.Position.Y,khrp.Position.Z)
+                hrp.CFrame=hrp.CFrame:Lerp(CFrame.new(hrp.Position,tgt),BS_LERP_SPEED)
+            end
+        end)
+    end
+
+    ----------------------------------------------------------------
+    -- Dash-Stab Tech
+    ----------------------------------------------------------------
+    local function bsPerformDashStabTech(killerModel)
+        if not killerModel or not bsRunning then return end
+        local char=bsGetChar(); local hrp=char and char:FindFirstChild("HumanoidRootPart")
+        local khrp=killerModel:FindFirstChild("HumanoidRootPart")
+        if not hrp or not khrp then return end
+
+        -- Step 1: snap Two Time to face the killer (direction of lunge)
+        bsSetAutoRotate(false)
+        local aimTarget=Vector3.new(khrp.Position.X,hrp.Position.Y,khrp.Position.Z)
+        hrp.CFrame=CFrame.lookAt(hrp.Position,aimTarget,Vector3.new(0,1,0))
+
+        -- Step 2: fire dagger — server starts 0.3s windup
+        if bsDaggerEnabled then bsTryActivateButton(bsGetDaggerButton()) end
+
+        -- Step 3: wait for server windup + network latency
+        task.wait(BS_DASH_FLIP_DELAY)
+        if not bsRunning then bsSetAutoRotate(true); return end
+
+        -- Step 4: hold rotation locked to killer's LookVector for the hitbox window
+        local holdStart=os.clock(); local firstFrame=true; local holdConn
+        holdConn=svc.Run.Heartbeat:Connect(function()
+            if not bsRunning or os.clock()-holdStart>=BS_LUNGE_HOLD_DURATION then
+                holdConn:Disconnect(); bsSetAutoRotate(true); return
+            end
+            local khrp2=killerModel:FindFirstChild("HumanoidRootPart")
+            local char2=bsGetChar(); local hrp2=char2 and char2:FindFirstChild("HumanoidRootPart")
+            if khrp2 and hrp2 then
+                local look=khrp2.CFrame.LookVector
+                local nudgedPos=hrp2.Position
+                if firstFrame then
+                    firstFrame=false
+                    nudgedPos=Vector3.new(
+                        hrp2.Position.X+look.X*BS_DEPTH_OFFSET,
+                        hrp2.Position.Y,
+                        hrp2.Position.Z+look.Z*BS_DEPTH_OFFSET
+                    )
                 end
-            end)
+                hrp2.CFrame=CFrame.lookAt(nudgedPos,nudgedPos+look,Vector3.new(0,1,0))
+            end
+        end)
+    end
+
+    ----------------------------------------------------------------
+    -- Visual radius ring
+    ----------------------------------------------------------------
+    local bsRadiusParts = {}
+    local bsShowRadius  = true
+    local bsNoclipEnabled   = false
+    local bsNoclipConn      = nil
+
+    local function bsGetOrCreateRadiusPart(killer)
+        if bsRadiusParts[killer] then return bsRadiusParts[killer] end
+        local part=Instance.new("Part")
+        part.Name="V1PRWARERadius"; part.Anchored=true; part.CanCollide=false
+        part.CanQuery=false; part.CanTouch=false; part.CastShadow=false
+        part.Shape=Enum.PartType.Cylinder; part.Material=Enum.Material.Neon
+        part.Transparency=0.65; part.Color=Color3.fromRGB(0,200,255)
+        part.Size=Vector3.new(0.15,2,2); part.Parent=svc.WS
+        bsRadiusParts[killer]=part
+        killer.AncestryChanged:Connect(function()
+            if not killer:IsDescendantOf(svc.WS) then
+                part:Destroy(); bsRadiusParts[killer]=nil
+            end
+        end)
+        return part
+    end
+    local function bsDestroyAllRadiusParts()
+        for _,part in pairs(bsRadiusParts) do pcall(function() part:Destroy() end) end
+        bsRadiusParts={}
+    end
+    local function bsUpdateRadiusPart(killer, khrp, range, inside)
+        if not bsShowRadius then
+            local existing=bsRadiusParts[killer]
+            if existing then existing:Destroy(); bsRadiusParts[killer]=nil end
+            return
+        end
+        local part=bsGetOrCreateRadiusPart(killer)
+        local diameter=range*2
+        local footY=khrp.Position.Y-3
+        part.Size=Vector3.new(0.15,diameter,diameter)
+        part.CFrame=CFrame.new(khrp.Position.X,footY,khrp.Position.Z)*CFrame.Angles(0,0,math.pi/2)
+        if inside then
+            local pulse=0.5+0.5*math.sin(os.clock()*8)
+            part.Color=Color3.fromRGB(255,math.floor(pulse*80),0)
+            part.Transparency=0.3+pulse*0.2
+        else
+            part.Color=Color3.fromRGB(0,180,255)
+            part.Transparency=0.65
         end
     end
 
+    local function bsSetNoclip(state)
+        bsNoclipEnabled=state
+        if bsNoclipConn then bsNoclipConn:Disconnect(); bsNoclipConn=nil end
+        if state then
+            bsNoclipConn=svc.Run.Stepped:Connect(function()
+                local char=lp.Character; if not char then return end
+                for _,part in ipairs(char:GetDescendants()) do
+                    if part:IsA("BasePart") then part.CanCollide=false end
+                end
+            end)
+        else
+            local char=lp.Character; if char then
+                for _,part in ipairs(char:GetDescendants()) do
+                    if part:IsA("BasePart") then part.CanCollide=true end
+                end
+            end
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- Main detection loop
+    ----------------------------------------------------------------
     task.spawn(function()
         while bsRunning do
             task.wait(BS_CHECK_INTERVAL)
             if not bsEnabled or not bsRunning then continue end
             local kf=bsGetKillersFolder(); if not kf then continue end
             local char=bsGetChar(); local hrp=char and char:FindFirstChild("HumanoidRootPart"); if not hrp then continue end
+
             for _,killer in pairs(kf:GetChildren()) do
                 if not bsIsValidKiller(killer) then continue end
                 local khrp=killer:FindFirstChild("HumanoidRootPart")
                 local dist=(khrp.Position-hrp.Position).Magnitude
-                local shouldTrigger=false
-                if bsRangeMode=="Around" then
-                    if dist<=bsProximity then shouldTrigger=true end
-                else
-                    local rel=hrp.Position-khrp.Position
-                    local fdot=rel:Dot(khrp.CFrame.LookVector)
-                    if fdot<0.3 and (-fdot)<=bsProximity and dist<=bsProximity then shouldTrigger=true end
+                local killerSpeed=bsGetKillerSpeed(killer)
+                local nowClock=os.clock()
+                if killerSpeed>BS_SPRINT_THRESHOLD then bsKillerSprintLatch[killer]=nowClock end
+                local latchAge=bsKillerSprintLatch[killer] and (nowClock-bsKillerSprintLatch[killer]) or math.huge
+                local isSprinting=killerSpeed>BS_SPRINT_THRESHOLD or latchAge<0.06
+                local effectiveRange=bsBaseProximity+(isSprinting and BS_RANGE_SPRINT_BONUS or 0)
+
+                if bsDetectionRangeSlider and effectiveRange~=bsLastDisplayedRange then
+                    bsLastDisplayedRange=effectiveRange
+                    bsSuppressCallback=true
+                    pcall(function() bsDetectionRangeSlider:SetValue(effectiveRange) end)
+                    bsSuppressCallback=false
                 end
-                if shouldTrigger and os.clock()-bsLastTrigger>=BS_COOLDOWN then
-                    local cdNum=bsReadCooldown(bsGetDaggerCooldown())
-                    if not (cdNum and cdNum>0.1) then
-                        bsLastTrigger=os.clock()
-                        task.spawn(function()
-                            bsActivateForKiller(killer,BS_DEFAULT_DURATION)
-                            if BS_REMOTE_FIRE_DELAY>0 then task.wait(BS_REMOTE_FIRE_DELAY) end
-                            if bsDaggerEnabled then bsTryActivateButton(bsGetDaggerButton()) end
-                            if BS_AIM_SNAP_DELAY>0 then
-                                task.wait(BS_AIM_SNAP_DELAY)
-                                if not bsRunning then return end
-                                local khrp2=killer:FindFirstChild("HumanoidRootPart")
-                                local char2=bsGetChar(); local hrp2=char2 and char2:FindFirstChild("HumanoidRootPart")
-                                if khrp2 and hrp2 then
-                                    local tp=Vector3.new(khrp2.Position.X,hrp2.Position.Y,khrp2.Position.Z)
-                                    hrp2.CFrame=CFrame.new(hrp2.Position,tp)
+
+                local inside=dist<=effectiveRange
+                bsUpdateRadiusPart(killer,khrp,effectiveRange,inside)
+
+                if bsMode=="Auto Backstab" then
+                    local toKiller=(khrp.Position-hrp.Position).Unit
+                    local dot=toKiller:Dot(khrp.CFrame.LookVector)
+                    local shouldTrigger=dot>BS_BACKSTAB_THRESHOLD_COS and dist<=effectiveRange
+
+                    if shouldTrigger and os.clock()-bsLastTrigger>=BS_COOLDOWN then
+                        local cdNum=bsReadCooldown(bsGetDaggerCooldown())
+                        if not (cdNum and cdNum>0.1) then
+                            bsLastTrigger=os.clock()
+                            task.spawn(function()
+                                bsAimAtKiller(killer,0.5)
+                                if bsDaggerEnabled then bsTryActivateButton(bsGetDaggerButton()) end
+                                if BS_AIM_SNAP_DELAY>0 then
+                                    task.wait(BS_AIM_SNAP_DELAY)
+                                    if not bsRunning then return end
+                                    local khrp2=killer:FindFirstChild("HumanoidRootPart")
+                                    local char2=bsGetChar(); local hrp2=char2 and char2:FindFirstChild("HumanoidRootPart")
+                                    if khrp2 and hrp2 then
+                                        local tgt=Vector3.new(khrp2.Position.X,hrp2.Position.Y,khrp2.Position.Z)
+                                        hrp2.CFrame=CFrame.lookAt(hrp2.Position,tgt,Vector3.new(0,1,0))
+                                    end
                                 end
-                            end
-                        end)
-                        break
+                            end)
+                            break
+                        end
+                    end
+
+                elseif bsMode=="Dash-Stab Tech" then
+                    local toPlayer=(hrp.Position-khrp.Position).Unit
+                    local dot=toPlayer:Dot(khrp.CFrame.LookVector)
+                    local inFront=dot>BS_BACKSTAB_THRESHOLD_COS and dist<=effectiveRange
+
+                    local twoTimeCrouching=false
+                    local ttChar=bsGetChar()
+                    if ttChar then twoTimeCrouching=ttChar:GetAttribute("Crouching")==true end
+
+                    if inFront and twoTimeCrouching and os.clock()-bsLastTrigger>=BS_COOLDOWN then
+                        local cdNum=bsReadCooldown(bsGetDaggerCooldown())
+                        if not (cdNum and cdNum>0.1) then
+                            bsLastTrigger=os.clock()
+                            task.spawn(function() bsPerformDashStabTech(killer) end)
+                            break
+                        end
                     end
                 end
             end
         end
     end)
 
-    bsSection:Toggle({ Title="Auto Backstab", Type="Checkbox", Default=false, Callback=function(v) bsEnabled=v end })
-    bsSection:Toggle({ Title="Auto Stab on Backstab", Type="Checkbox", Default=false, Callback=function(v) bsDaggerEnabled=v end })
-    bsSection:Dropdown({ Title="Backstab Type", Values={"Lerp","Teleport","Aim"}, Value="Lerp", Callback=function(v) bsBackstabType=v end })
-    bsSection:Dropdown({ Title="Range Mode", Values={"Around","Behind"}, Value="Behind", Callback=function(v) bsRangeMode=v end })
-    bsSection:Slider({ Title="Detection Range", Step=1, Value={Min=1,Max=30,Default=BS_DEFAULT_PROXIMITY}, Callback=function(v) bsProximity=v end })
-    bsSection:Slider({ Title="Behind Distance", Step=0.5, Value={Min=0.5,Max=10,Default=BS_BEHIND_DISTANCE}, Callback=function(v) BS_BEHIND_DISTANCE=v end })
-    bsSection:Slider({ Title="Remote Fire Delay (s)", Step=0.01, Value={Min=0.00,Max=0.50,Default=BS_REMOTE_FIRE_DELAY}, Callback=function(v) BS_REMOTE_FIRE_DELAY=v end })
-    bsSection:Slider({ Title="Aim Snap Delay (s)", Step=0.01, Value={Min=0.00,Max=0.25,Default=BS_AIM_SNAP_DELAY}, Callback=function(v) BS_AIM_SNAP_DELAY=v end })
+    ----------------------------------------------------------------
+    -- UI
+    ----------------------------------------------------------------
+    bsSection:Toggle({ Title="Enabled", Type="Checkbox", Default=false,
+        Callback=function(v) bsEnabled=v end })
+
+    bsSection:Toggle({ Title="Auto Use Dagger", Type="Checkbox", Default=false,
+        Callback=function(v) bsDaggerEnabled=v end })
+
+    bsSection:Dropdown({ Title="Mode", Values={"Auto Backstab","Dash-Stab Tech"}, Value="Auto Backstab",
+        Callback=function(v) bsMode=v end })
+
+    bsDetectionRangeSlider=bsSection:Slider({ Title="Detection Range", Step=1,
+        Value={Min=1,Max=32,Default=BS_DEFAULT_PROXIMITY},
+        Callback=function(v) if not bsSuppressCallback then bsBaseProximity=v end end })
+
+    -- Auto Backstab only
+    bsSection:Slider({ Title="Aim Snap Delay (s)", Step=0.01,
+        Value={Min=0.00,Max=0.40,Default=BS_AIM_SNAP_DELAY},
+        Callback=function(v) BS_AIM_SNAP_DELAY=v end })
+
+    -- Dash-Stab Tech timing
+    bsSection:Slider({ Title="Flip Delay (s)", Step=0.01,
+        Desc="SERVER_WINDUP 0.30s + ping. Raise if missing.",
+        Value={Min=0.28,Max=0.65,Default=BS_DASH_FLIP_DELAY},
+        Callback=function(v) BS_DASH_FLIP_DELAY=v end })
+
+    bsSection:Slider({ Title="Lunge Hold (s)", Step=0.005,
+        Desc="0.25 = uncrouched hitbox, 0.415 = crouched",
+        Value={Min=0.10,Max=0.50,Default=BS_LUNGE_HOLD_DURATION},
+        Callback=function(v) BS_LUNGE_HOLD_DURATION=v end })
+
+    bsSection:Slider({ Title="Depth Offset (st)", Step=0.25,
+        Desc="Nudge forward into killer at flip. Keep under 4.",
+        Value={Min=0.0,Max=5.0,Default=BS_DEPTH_OFFSET},
+        Callback=function(v) BS_DEPTH_OFFSET=v end })
+
+    bsSection:Toggle({ Title="Noclip (easier backstabs)", Type="Checkbox", Default=false,
+        Callback=function(v) bsSetNoclip(v) end })
+
+    bsSection:Toggle({ Title="Show Radius Ring", Type="Checkbox", Default=true,
+        Callback=function(v) bsShowRadius=v; if not v then bsDestroyAllRadiusParts() end end })
+
+    bsSection:Button({ Title="Unload TwoTime", Callback=function()
+        bsRunning=false; bsEnabled=false; bsSetNoclip(false); bsDestroyAllRadiusParts()
+        ui:Notify({Title="TwoTime",Content="Unloaded.",Icon="check",Duration=3})
+    end})
 end
 
 ------------------------------------------------------------------------
 ------------------------------------------------------------------------
--- TAB: AUTO TRICK (Veeronica)
+-- TAB: VEERONICA
 ------------------------------------------------------------------------
 ------------------------------------------------------------------------
-local tabAutoTrick = win:Tab({ Title = "Auto Trick", Icon = "zap" })
-local secAutoTrick = tabAutoTrick:Section({ Title = "Veeronica Auto Trick", Opened = true })
+local tabVeeronica = win:Tab({ Title = "Veeronica", Icon = "zap" })
+local secAutoTrick = tabVeeronica:Section({ Title = "Auto Trick", Opened = true })
 
 do
     local atEnabled = false
@@ -2243,6 +2165,548 @@ do
 end
 
 ------------------------------------------------------------------------
+-- SECTION: SK8 CONTROL (Veeronica Charge Override)
+------------------------------------------------------------------------
+local secSK8 = tabVeeronica:Section({ Title = "SK8 Control", Opened = true })
+
+do
+    local sk8_Players = game:GetService("Players")
+    local sk8_RunService = game:GetService("RunService")
+    local sk8_lp = sk8_Players.LocalPlayer
+    local sk8_camera = workspace.CurrentCamera
+    local sk8_UserInputService = game:GetService("UserInputService")
+    local sk8_shiftlockEnabled = false
+    local sk8_shiftConn = nil
+
+    local function sk8_setShiftlock(state)
+        sk8_shiftlockEnabled = state
+        if sk8_shiftConn then
+            sk8_shiftConn:Disconnect()
+            sk8_shiftConn = nil
+        end
+        if sk8_shiftlockEnabled then
+            sk8_UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+            sk8_shiftConn = sk8_RunService.RenderStepped:Connect(function()
+                local character = sk8_lp.Character
+                local root = character and character:FindFirstChild("HumanoidRootPart")
+                if root then
+                    local camCF = sk8_camera.CFrame
+                    root.CFrame = CFrame.new(root.Position, Vector3.new(
+                        camCF.LookVector.X + root.Position.X,
+                        root.Position.Y,
+                        camCF.LookVector.Z + root.Position.Z
+                    ))
+                end
+            end)
+        else
+            sk8_UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+        end
+    end
+
+    local sk8_chargeAnimIds = { "117058860640843" }
+    local sk8_DASH_SPEED = 60
+    local sk8_controlEnabled = cfg.get("sk8ControlEnabled", true)
+    local sk8_controlActive = false
+    local sk8_overrideConn = nil
+    local sk8_savedHumState = {}
+
+    local function sk8_getHumanoid()
+        if not sk8_lp or not sk8_lp.Character then return nil end
+        return sk8_lp.Character:FindFirstChildOfClass("Humanoid")
+    end
+
+    local function sk8_saveHumState(hum)
+        if not hum or sk8_savedHumState[hum] then return end
+        local s = {}
+        pcall(function()
+            s.WalkSpeed = hum.WalkSpeed
+            local ok, _ = pcall(function() s.JumpPower = hum.JumpPower end)
+            if not ok then pcall(function() s.JumpPower = hum.JumpHeight end) end
+            local ok2, ar = pcall(function() return hum.AutoRotate end)
+            if ok2 then s.AutoRotate = ar end
+            s.PlatformStand = hum.PlatformStand
+        end)
+        sk8_savedHumState[hum] = s
+    end
+
+    local function sk8_restoreHumState(hum)
+        if not hum then return end
+        local s = sk8_savedHumState[hum]
+        if not s then return end
+        pcall(function()
+            if s.WalkSpeed ~= nil then hum.WalkSpeed = s.WalkSpeed end
+            if s.JumpPower ~= nil then
+                local ok, _ = pcall(function() hum.JumpPower = s.JumpPower end)
+                if not ok then pcall(function() hum.JumpHeight = s.JumpPower end) end
+            end
+            if s.AutoRotate ~= nil then pcall(function() hum.AutoRotate = s.AutoRotate end) end
+            if s.PlatformStand ~= nil then hum.PlatformStand = s.PlatformStand end
+        end)
+        sk8_savedHumState[hum] = nil
+    end
+
+    local function sk8_startOverride()
+        if sk8_controlActive then return end
+        local hum = sk8_getHumanoid()
+        if not hum then return end
+        sk8_controlActive = true
+        sk8_saveHumState(hum)
+        pcall(function()
+            hum.WalkSpeed = sk8_DASH_SPEED
+            hum.AutoRotate = false
+        end)
+        sk8_setShiftlock(true)
+        sk8_overrideConn = sk8_RunService.RenderStepped:Connect(function()
+            local humanoid = sk8_getHumanoid()
+            local rootPart = humanoid and humanoid.Parent and humanoid.Parent:FindFirstChild("HumanoidRootPart")
+            if not humanoid or not rootPart then return end
+            pcall(function()
+                humanoid.WalkSpeed = sk8_DASH_SPEED
+                humanoid.AutoRotate = false
+            end)
+            local direction = rootPart.CFrame.LookVector
+            local horizontal = Vector3.new(direction.X, 0, direction.Z)
+            if horizontal.Magnitude > 0 then
+                humanoid:Move(horizontal.Unit)
+            else
+                humanoid:Move(Vector3.new(0,0,0))
+            end
+        end)
+    end
+
+    local function sk8_stopOverride()
+        if not sk8_controlActive then return end
+        sk8_controlActive = false
+        if sk8_overrideConn then
+            pcall(function() sk8_overrideConn:Disconnect() end)
+            sk8_overrideConn = nil
+        end
+        sk8_setShiftlock(false)
+        local hum = sk8_getHumanoid()
+        if hum then
+            pcall(function()
+                sk8_restoreHumState(hum)
+                hum:Move(Vector3.new(0,0,0))
+            end)
+        end
+    end
+
+    local function sk8_detectChargeAnim()
+        local hum = sk8_getHumanoid()
+        if not hum then return false end
+        for _, track in ipairs(hum:GetPlayingAnimationTracks()) do
+            local ok, animId = pcall(function()
+                return tostring(track.Animation and track.Animation.AnimationId or ""):match("%d+")
+            end)
+            if ok and animId and animId ~= "" then
+                if table.find(sk8_chargeAnimIds, animId) then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    -- Main detection loop
+    sk8_RunService.RenderStepped:Connect(function()
+        if not sk8_controlEnabled then
+            if sk8_controlActive then sk8_stopOverride() end
+            return
+        end
+        local hum = sk8_getHumanoid()
+        if not hum then
+            if sk8_controlActive then sk8_stopOverride() end
+            return
+        end
+        if sk8_detectChargeAnim() then
+            if not sk8_controlActive then sk8_startOverride() end
+        else
+            if sk8_controlActive then sk8_stopOverride() end
+        end
+    end)
+
+    sk8_lp.CharacterAdded:Connect(function()
+        if sk8_shiftConn then sk8_shiftConn:Disconnect(); sk8_shiftConn = nil end
+        sk8_savedHumState = {}
+    end)
+
+    -- Slider for dash speed removed - now hardcoded to 60
+    local sk8_speedVal = 60
+    sk8_DASH_SPEED = sk8_speedVal
+
+    secSK8:Toggle({
+        Title = "Enable SK8 Control", Type = "Checkbox", Flag = "sk8ControlEnabled",
+        Default = sk8_controlEnabled,
+        Callback = function(on)
+            sk8_controlEnabled = on
+            cfg.set("sk8ControlEnabled", on)
+            if not on and sk8_controlActive then sk8_stopOverride() end
+        end
+    })
+
+    secSK8:Paragraph({
+        Title   = "How it works",
+        Content = "Detects Veeronica's charge animation (ID 117058860640843) and forces forward movement at 60 speed with shiftlock active. Automatically restores your original stats when the charge ends.",
+    })
+end
+
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+-- TAB: JANE DOE  (V1perThrow – Crystal / Axe Lock)
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+local tabJaneDoe = win:Tab({ Title = "Jane Doe", Icon = "gem" })
+
+do
+    -- ── shared state ──────────────────────────────────────────────────
+    local jd_Players           = svc.Players
+    local jd_Run               = svc.Run
+    local jd_RS                = svc.RS
+    local jd_lp                = lp
+    local jd_Camera            = svc.WS.CurrentCamera
+
+    local jd_RemoteEvent = nil
+    local jd_NetworkRF   = nil
+    pcall(function()
+        jd_RemoteEvent = jd_RS
+            :WaitForChild("Modules", 10)
+            :WaitForChild("Network", 10)
+            :WaitForChild("Network", 10)
+            :WaitForChild("RemoteEvent", 10)
+    end)
+    pcall(function()
+        jd_NetworkRF = jd_RS
+            :WaitForChild("Modules", 10)
+            :WaitForChild("Network", 10)
+            :WaitForChild("Network", 10)
+            :WaitForChild("RemoteFunction", 10)
+    end)
+
+    local jd_enabled       = false
+    local jd_aimbotOn      = false
+    local jd_patched       = false
+    local jd_crystalCB     = nil
+    local jd_unloaded      = false
+
+    local jd_AIM_OFFSET    = -0.3
+    local jd_PREDICTION    = 0.6
+    local jd_HOLD_DURATION = 0.9
+
+    local jd_AXE_DURATION      = 1.7
+    local jd_axeLockEnabled    = false
+    local jd_axeLockActive     = false
+    local jd_axeLockConn       = nil
+    local jd_axeHookConn       = nil
+
+    local jd_killerMotionData  = {}
+
+    -- ── helpers ───────────────────────────────────────────────────────
+    local function jd_getKillerVelocity(hrp)
+        local now  = tick()
+        local pos  = hrp.Position
+        local data = jd_killerMotionData[hrp]
+        if not data then
+            jd_killerMotionData[hrp] = { lastPos = pos, lastTime = now, velocity = Vector3.zero }
+            return Vector3.zero
+        end
+        local dt = now - data.lastTime
+        if dt <= 0 then return data.velocity end
+        local vel     = (pos - data.lastPos) / dt
+        data.lastPos  = pos
+        data.lastTime = now
+        data.velocity = vel
+        return vel
+    end
+
+    local function jd_getNearestKiller(fromPos)
+        local folder = svc.WS:FindFirstChild("Players")
+        folder = folder and folder:FindFirstChild("Killers")
+        if not folder then return nil end
+        local nearest, best = nil, math.huge
+        for _, model in ipairs(folder:GetChildren()) do
+            local hrp = model:FindFirstChild("HumanoidRootPart")
+            local hum = model:FindFirstChildOfClass("Humanoid")
+            if hrp and hum and hum.Health > 0 then
+                local d = (hrp.Position - fromPos).Magnitude
+                if d < best then best = d; nearest = model end
+            end
+        end
+        return nearest
+    end
+
+    -- ── axe lock ──────────────────────────────────────────────────────
+    local CRYSTAL_LO = 0xe8812534
+    local CRYSTAL_HI = 0x1055d474
+    local function jd_isCrystalBuf(buf)
+        if typeof(buf) ~= "buffer" or buffer.len(buf) < 8 then return false end
+        local ok, lo, hi = pcall(function()
+            return buffer.readu32(buf, 0), buffer.readu32(buf, 4)
+        end)
+        return ok and lo == CRYSTAL_LO and hi == CRYSTAL_HI
+    end
+    local function jd_axeMatchesBuf(buf)
+        if typeof(buf) ~= "buffer" then return false end
+        if buffer.len(buf) ~= 8 then return false end
+        return not jd_isCrystalBuf(buf)
+    end
+
+    local function jd_axeStopLock()
+        jd_axeLockActive = false
+        if jd_axeLockConn then jd_axeLockConn:Disconnect(); jd_axeLockConn = nil end
+    end
+
+    local function jd_axeStartLock()
+        if jd_axeLockActive then return end
+        local char  = jd_lp.Character
+        local myHRP = char and char:FindFirstChild("HumanoidRootPart")
+        local myHum = char and char:FindFirstChildOfClass("Humanoid")
+        if not myHRP or not myHum then return end
+        local killer    = jd_getNearestKiller(myHRP.Position)
+        local killerHRP = killer and killer:FindFirstChild("HumanoidRootPart")
+        if not killerHRP then return end
+        jd_axeLockActive = true
+        local savedAutoRotate = myHum.AutoRotate
+        myHum.AutoRotate = false
+        local startTime = tick()
+        if jd_axeLockConn then jd_axeLockConn:Disconnect(); jd_axeLockConn = nil end
+        jd_axeLockConn = jd_Run.Heartbeat:Connect(function()
+            local elapsed = tick() - startTime
+            if elapsed >= jd_AXE_DURATION or not jd_axeLockEnabled or not jd_axeLockActive
+                or not myHRP.Parent or not killerHRP.Parent then
+                jd_axeLockActive    = false
+                myHum.AutoRotate    = savedAutoRotate
+                jd_axeLockConn:Disconnect()
+                jd_axeLockConn = nil
+                return
+            end
+            local dir  = (killerHRP.Position - myHRP.Position)
+            local flat = Vector3.new(dir.X, 0, dir.Z)
+            if flat.Magnitude > 0.01 then
+                myHRP.CFrame = CFrame.lookAt(myHRP.Position, myHRP.Position + flat.Unit)
+            end
+        end)
+    end
+
+    local function jd_axeStartDetection()
+        if jd_axeHookConn then return end
+        local originalNC
+        originalNC = hookmetamethod(game, "__namecall", function(self, ...)
+            local method = getnamecallmethod()
+            if method == "FireServer" and self == jd_RemoteEvent then
+                local args = { ... }
+                if args[1] == "UseActorAbility"
+                    and type(args[2]) == "table"
+                    and jd_axeMatchesBuf(args[2][1])
+                    and jd_axeLockEnabled then
+                    task.spawn(jd_axeStartLock)
+                end
+            end
+            return originalNC(self, ...)
+        end)
+        jd_axeHookConn = true
+    end
+
+    local function jd_axeStopDetection()
+        jd_axeStopLock()
+        jd_axeHookConn = nil
+    end
+
+    -- ── crystal fire ──────────────────────────────────────────────────
+    local function jd_fireCrystal()
+        if not jd_RemoteEvent then return end
+        local buf = buffer.create(8)
+        buffer.writeu32(buf, 0, 0xe8812534)
+        buffer.writeu32(buf, 4, 0x1055d474)
+        jd_RemoteEvent:FireServer("UseActorAbility", { buf })
+    end
+
+    -- ── ballistic solver ──────────────────────────────────────────────
+    local function jd_buildCamCF(myHRP, killerHRP, v0, g)
+        local hum      = myHRP.Parent and myHRP.Parent:FindFirstChildOfClass("Humanoid")
+        local hipH     = hum and hum.HipHeight or 1.35
+        local v238     = (hipH + myHRP.Size.Y / 2) / 2
+        local spawnPos = myHRP.CFrame.Position + Vector3.new(0, v238, 0)
+        local vel       = jd_getKillerVelocity(killerHRP)
+        local predicted = killerHRP.Position + vel * jd_PREDICTION
+        local target    = predicted + Vector3.new(0, jd_AIM_OFFSET, 0)
+        local delta = target - spawnPos
+        local flatV = Vector3.new(delta.X, 0, delta.Z)
+        local dx    = flatV.Magnitude
+        local dy    = delta.Y
+        if dx < 0.01 then
+            local d = dy >= 0 and Vector3.new(0,1,0) or Vector3.new(0,-1,0)
+            return CFrame.new(jd_Camera.CFrame.Position, jd_Camera.CFrame.Position + d)
+        end
+        local flatDir = flatV.Unit
+        local v2   = v0 * v0
+        local disc = v2 * v2 - g * (g * dx * dx + 2 * dy * v2)
+        local theta = disc < 0
+            and math.atan2(dy, dx)
+            or  math.atan2(v2 - math.sqrt(disc), g * dx)
+        local T     = math.tan(theta)
+        local denom = 3 + T
+        local alpha = math.abs(denom) < 0.0001
+            and -math.pi / 2
+            or  math.atan2(3 * T - 1, denom)
+        local yawCF = CFrame.new(jd_Camera.CFrame.Position,
+                                 jd_Camera.CFrame.Position + flatDir)
+        return yawCF * CFrame.Angles(alpha, 0, 0)
+    end
+
+    -- ── patch / unpatch ───────────────────────────────────────────────
+    local function jd_getLocalActor()
+        return jd_lp.Character
+    end
+
+    local function jd_applyPatch(actor)
+        if jd_patched or not actor or not jd_NetworkRF then return end
+        if type(getcallbackvalue) == "function" then
+            pcall(function() jd_crystalCB = getcallbackvalue(jd_NetworkRF, "OnClientInvoke") end)
+        end
+        jd_NetworkRF.OnClientInvoke = function(reqName, ...)
+            if reqName == "GetCameraCF" and jd_enabled and jd_aimbotOn then
+                local char  = jd_lp.Character
+                local myHRP = char and char:FindFirstChild("HumanoidRootPart")
+                if myHRP then
+                    local killer    = jd_getNearestKiller(myHRP.Position)
+                    local killerHRP = killer and killer:FindFirstChild("HumanoidRootPart")
+                    if killerHRP then
+                        local ok, cf = pcall(jd_buildCamCF, myHRP, killerHRP, 250, 40)
+                        if ok and cf then return cf end
+                    end
+                end
+            end
+            if jd_crystalCB then return jd_crystalCB(reqName, ...) end
+        end
+        jd_lp:SetAttribute("Device", "Mobile")
+        jd_patched = true
+    end
+
+    local function jd_removePatch()
+        if not jd_patched then return end
+        pcall(function() if jd_NetworkRF then jd_NetworkRF.OnClientInvoke = jd_crystalCB end end)
+        pcall(function() jd_lp:SetAttribute("Device", nil) end)
+        jd_crystalCB = nil
+        jd_patched   = false
+    end
+
+    -- ── auto-fire loop ────────────────────────────────────────────────
+    task.spawn(function()
+        while not jd_unloaded do
+            task.wait(0.1)
+            if not jd_enabled or not jd_patched then continue end
+            local char  = jd_lp.Character
+            if not char then continue end
+            local myHRP = char:FindFirstChild("HumanoidRootPart")
+            if not myHRP then continue end
+            if jd_aimbotOn then
+                local killer    = jd_getNearestKiller(myHRP.Position)
+                local killerHRP = killer and killer:FindFirstChild("HumanoidRootPart")
+                if killerHRP then
+                    jd_Run.Heartbeat:Wait()
+                    jd_Run.Heartbeat:Wait()
+                end
+            end
+            jd_fireCrystal()
+            task.wait(jd_HOLD_DURATION + 0.2)
+        end
+    end)
+
+    -- ── actor watcher ─────────────────────────────────────────────────
+    task.spawn(function()
+        local lastActor = nil
+        while not jd_unloaded do
+            task.wait(0.5)
+            local cur = jd_getLocalActor()
+            if cur ~= lastActor then
+                if lastActor ~= nil then
+                    jd_patched = false; jd_crystalCB = nil
+                    jd_killerMotionData = {}; jd_axeStopLock()
+                end
+                lastActor = cur
+                if cur and jd_enabled then jd_applyPatch(cur) end
+            end
+        end
+    end)
+
+    -- ── UI ────────────────────────────────────────────────────────────
+    local jdMain = tabJaneDoe:Section({ Title = "Crystal Auto-Fire", Opened = true })
+
+    jdMain:Toggle({
+        Title = "Enable Auto-Fire", Type = "Checkbox", Default = false,
+        Callback = function(on)
+            jd_enabled = on
+            local actor = jd_getLocalActor()
+            if on and not jd_patched and actor then jd_applyPatch(actor) end
+        end
+    })
+
+    jdMain:Toggle({
+        Title = "Aimbot (Silent Aim)", Type = "Checkbox", Default = false,
+        Callback = function(on)
+            jd_aimbotOn = on
+            if not on then jd_killerMotionData = {} end
+            local actor = jd_getLocalActor()
+            if on and not jd_patched and actor then jd_applyPatch(actor) end
+        end
+    })
+
+    jdMain:Divider()
+
+    jdMain:Slider({
+        Title = "Aim Offset (Y)", Step = 0.1,
+        Value = { Min = -5.0, Max = 5.0, Default = jd_AIM_OFFSET },
+        Callback = function(v) jd_AIM_OFFSET = v end
+    })
+
+    jdMain:Slider({
+        Title = "Prediction", Step = 0.01,
+        Value = { Min = 0.0, Max = 1.0, Default = jd_PREDICTION },
+        Callback = function(v) jd_PREDICTION = v end
+    })
+
+    jdMain:Slider({
+        Title = "Hold Duration (s)", Step = 0.1,
+        Value = { Min = 0.3, Max = 2.0, Default = jd_HOLD_DURATION },
+        Callback = function(v) jd_HOLD_DURATION = v end
+    })
+
+    local jdAxe = tabJaneDoe:Section({ Title = "Axe Lock", Opened = true })
+
+    jdAxe:Paragraph({
+        Title   = "How it works",
+        Content = "Intercepts your axe FireServer call and locks your character facing the nearest killer for 1.7s. Camera never moves.",
+    })
+
+    jdAxe:Toggle({
+        Title = "Enable Axe Lock", Type = "Checkbox", Default = false,
+        Callback = function(on)
+            jd_axeLockEnabled = on
+            if on then jd_axeStartDetection() else jd_axeStopDetection() end
+        end
+    })
+
+    jdAxe:Slider({
+        Title = "Lock Duration (s)", Step = 0.1,
+        Value = { Min = 0.5, Max = 3.0, Default = jd_AXE_DURATION },
+        Callback = function(v) jd_AXE_DURATION = v end
+    })
+
+    local jdSettings = tabJaneDoe:Section({ Title = "Control", Opened = true })
+
+    jdSettings:Button({
+        Title = "Unload Jane Doe",
+        Callback = function()
+            if jd_unloaded then return end
+            jd_unloaded = true; jd_enabled = false; jd_aimbotOn = false
+            pcall(jd_removePatch)
+            pcall(jd_axeStopDetection)
+            ui:Notify({ Title="Jane Doe", Content="Unloaded successfully.", Icon="check", Duration=3 })
+        end
+    })
+end
+
+------------------------------------------------------------------------
 ------------------------------------------------------------------------
 -- TAB: INTERFACE
 ------------------------------------------------------------------------
@@ -2254,4 +2718,3 @@ tabInterface:Button({ Title = "Close UI", Callback = function()
     local ok = pcall(function() win:Destroy() end)
     if not ok then pcall(function() win:Close() end) end
 end })
-
