@@ -1,0 +1,407 @@
+--[[
+    MM2 Silent Aim + ESP - Rayfield/Sirius GUI
+]]
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local Humanoid = Character:WaitForChild("Humanoid")
+
+LocalPlayer.CharacterAdded:Connect(function(c)
+    Character = c
+    Humanoid = c:WaitForChild("Humanoid")
+end)
+
+local Roles = { Murderer = nil, Sheriff = nil, Hero = nil }
+local ESPInstances = {}
+local BillboardInstances = {}
+local ESPToggle = true
+local SilentAIMEnabled = true
+
+local RC = RaycastParams.new()
+RC.IgnoreWater = true
+RC.FilterType = Enum.RaycastFilterType.Blacklist
+
+local AttackAnimations = {
+    "rbxassetid://2467567750", "rbxassetid://1957618848",
+    "rbxassetid://2470501967", "rbxassetid://2467577524"
+}
+
+local RoleColors = {
+    Murderer = Color3.fromRGB(255, 0,   0),
+    Sheriff  = Color3.fromRGB(0,   120, 255),
+    Hero     = Color3.fromRGB(255, 140, 0),
+    Innocent = Color3.fromRGB(0,   255, 0),
+}
+
+local RoleLabels = {
+    Murderer = "Murd",
+    Sheriff  = "Sheriff",
+    Hero     = "Hero",
+    Innocent = "Inno",
+}
+
+local ESPFolder = Instance.new("Folder")
+ESPFolder.Name = "MM2_ESP"
+ESPFolder.Parent = game:GetService("CoreGui")
+
+local BBFolder = Instance.new("Folder")
+BBFolder.Name = "MM2_Billboards"
+BBFolder.Parent = game:GetService("CoreGui")
+
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+local Window = Rayfield:CreateWindow({
+    Name = "MM2 Hub",
+    LoadingTitle = "MM2 hub",
+    LoadingSubtitle = "by thelevelist And mitsuki",
+    Theme = "Default",
+    DisableRayfieldPrompts = false,
+    DisableBuildWarnings = false,
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = "MM2Hub",
+        FileName = "Config"
+    },
+    KeySystem = false
+})
+
+local Tab = Window:CreateTab("Main", 4483362458)
+
+Tab:CreateToggle({
+    Name = "Silent Aim",
+    CurrentValue = true,
+    Flag = "SilentAim",
+    Callback = function(state)
+        SilentAIMEnabled = state
+        Rayfield:Notify({ Title = "Silent Aim", Content = "Enabled: " .. tostring(state), Duration = 3, Image = 4483362458 })
+    end
+})
+
+Tab:CreateToggle({
+    Name = "ESP",
+    CurrentValue = true,
+    Flag = "ESPToggle",
+    Callback = function(state)
+        ESPToggle = state
+        for _, h in ipairs(ESPInstances) do
+            if h and h.Parent then h.Enabled = state end
+        end
+        for _, b in ipairs(BillboardInstances) do
+            if b and b.Parent then b.Enabled = state end
+        end
+    end
+})
+
+Tab:CreateButton({
+    Name = "Notify Roles",
+    Callback = function()
+        local found = false
+        for role, plr in pairs(Roles) do
+            if plr then
+                found = true
+                Rayfield:Notify({ Title = role, Content = plr.Name, Duration = 5, Image = 4483362458 })
+            end
+        end
+        if not found then
+            Rayfield:Notify({ Title = "Roles", Content = "No roles detected yet.", Duration = 3, Image = 4483362458 })
+        end
+    end
+})
+
+Tab:CreateButton({
+    Name = "Toggle Speed",
+    Callback = function()
+        if Humanoid.WalkSpeed == 16 or Humanoid.WalkSpeed == 16.5 then
+            Humanoid.WalkSpeed = 20
+        else
+            Humanoid.WalkSpeed = 16.5
+        end
+        Rayfield:Notify({ Title = "Speed", Content = "Now: " .. tostring(Humanoid.WalkSpeed), Duration = 3, Image = 4483362458 })
+    end
+})
+
+Tab:CreateButton({
+    Name = "Claim Last Round Rewards",
+    Callback = function()
+        local ok, result = pcall(function()
+            return game:GetService("ReplicatedStorage")
+                :WaitForChild("Remotes")
+                :WaitForChild("Gameplay")
+                :WaitForChild("GetLastRoundRewards")
+                :InvokeServer()
+        end)
+        Rayfield:Notify({
+            Title = "Rewards",
+            Content = ok and "Claimed!" or "Failed: " .. tostring(result),
+            Duration = 4,
+            Image = 4483362458
+        })
+    end
+})
+
+-- Helpers
+local function GetPlayerRole(plr)
+    if Roles.Murderer == plr then return "Murderer" end
+    if Roles.Sheriff  == plr then return "Sheriff"  end
+    if Roles.Hero     == plr then return "Hero"      end
+    return "Innocent"
+end
+
+local function GetClosestPlayer()
+    local closest, dist = nil, math.huge
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+            local d = (Character.PrimaryPart.Position - plr.Character.HumanoidRootPart.Position).Magnitude
+            if d < dist then dist = d; closest = plr end
+        end
+    end
+    return closest
+end
+
+-- Billboard: role label only, transparent background
+local function CreateBillboard(plr)
+    if plr == LocalPlayer then return end
+    local char = plr.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    -- Remove old
+    for i = #BillboardInstances, 1, -1 do
+        local b = BillboardInstances[i]
+        if b and b.Name == "BB_" .. plr.Name then
+            b:Destroy(); table.remove(BillboardInstances, i)
+        end
+    end
+
+    local role = GetPlayerRole(plr)
+
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "BB_" .. plr.Name
+    bb.Adornee = hrp
+    bb.Size = UDim2.new(0, 60, 0, 20)
+    bb.StudsOffset = Vector3.new(0, 3.2, 0)
+    bb.AlwaysOnTop = true
+    bb.Enabled = ESPToggle
+    bb.Parent = BBFolder
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.fromScale(1, 1)
+    label.BackgroundTransparency = 1
+    label.Text = RoleLabels[role]
+    label.TextColor3 = RoleColors[role]
+    label.TextSize = 11
+    label.TextScaled = false
+    label.Font = Enum.Font.GothamBold
+    label.Parent = bb
+
+    table.insert(BillboardInstances, bb)
+end
+
+-- Highlight
+local function CreateESP(plr)
+    if plr == LocalPlayer then return end
+    local char = plr.Character
+    if not char then return end
+
+    for i = #ESPInstances, 1, -1 do
+        local e = ESPInstances[i]
+        if e and e.Name == "ESP_" .. plr.Name then
+            e:Destroy(); table.remove(ESPInstances, i)
+        end
+    end
+
+    local role = GetPlayerRole(plr)
+    local color = RoleColors[role]
+
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "ESP_" .. plr.Name
+    highlight.Adornee = char
+    highlight.FillColor = color
+    highlight.OutlineColor = color
+    highlight.FillTransparency = 0.5
+    highlight.OutlineTransparency = 0
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.Enabled = ESPToggle
+    highlight.Parent = ESPFolder
+
+    table.insert(ESPInstances, highlight)
+end
+
+-- Only call these when a tool is confirmed
+local function RefreshPlayer(plr)
+    CreateESP(plr)
+    CreateBillboard(plr)
+end
+
+local function RefreshAllESP()
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            RefreshPlayer(plr)
+        end
+    end
+end
+
+local function ClearAllESP()
+    for _, h in ipairs(ESPInstances) do if h and h.Parent then h:Destroy() end end
+    for _, b in ipairs(BillboardInstances) do if b and b.Parent then b:Destroy() end end
+    ESPInstances = {}
+    BillboardInstances = {}
+    Roles = { Murderer = nil, Sheriff = nil, Hero = nil }
+end
+
+-- Attack flash
+local function ConnectAttackFlash(plr, char)
+    local animator = char:WaitForChild("Humanoid"):WaitForChild("Animator")
+    animator.AnimationPlayed:Connect(function(track)
+        if track.Animation and table.find(AttackAnimations, track.Animation.AnimationId) then
+            for _, h in ipairs(ESPInstances) do
+                if h and h.Adornee == char then
+                    h.FillColor = Color3.fromRGB(255, 0, 255)
+                    h.OutlineColor = Color3.fromRGB(255, 0, 255)
+                    task.delay(1.2, function()
+                        if h and h.Parent then
+                            local c = RoleColors[GetPlayerRole(plr)]
+                            h.FillColor = c
+                            h.OutlineColor = c
+                        end
+                    end)
+                    break
+                end
+            end
+        end
+    end)
+end
+
+-- Track whether any tool has been seen this round
+local roundStarted = false
+
+local function InitializePlayer(plr)
+    local function OnCharacterAdded(char)
+        -- Never create ESP on spawn — wait for tool detection only
+        local function OnToolAdded(tool)
+            if tool.Name == "Knife" then
+                roundStarted = true
+                Roles.Murderer = plr
+                RefreshAllESP() -- now ESP all innocents too
+                ConnectAttackFlash(plr, char)
+            elseif tool.Name == "Gun" then
+                roundStarted = true
+                if Roles.Sheriff == nil or Roles.Sheriff.Character == nil then
+                    Roles.Sheriff = plr
+                elseif Roles.Sheriff ~= plr then
+                    Roles.Hero = plr
+                end
+                RefreshAllESP()
+                ConnectAttackFlash(plr, char)
+            end
+        end
+
+        plr.Backpack.ChildAdded:Connect(OnToolAdded)
+        char.ChildAdded:Connect(OnToolAdded)
+    end
+
+    if plr.Character then OnCharacterAdded(plr.Character) end
+    plr.CharacterAdded:Connect(OnCharacterAdded)
+end
+
+-- Round end detection: when murderer loses knife, clear ESP
+local function WatchRoundEnd()
+    task.spawn(function()
+        while true do
+            task.wait(2)
+            if roundStarted then
+                local knifeExists = false
+                for _, plr in ipairs(Players:GetPlayers()) do
+                    local char = plr.Character
+                    if char then
+                        for _, tool in ipairs(char:GetChildren()) do
+                            if tool:IsA("Tool") and tool.Name == "Knife" then
+                                knifeExists = true
+                            end
+                        end
+                    end
+                    for _, tool in ipairs(plr.Backpack:GetChildren()) do
+                        if tool.Name == "Knife" then knifeExists = true end
+                    end
+                end
+                if not knifeExists then
+                    ClearAllESP()
+                    roundStarted = false
+                end
+            end
+        end
+    end)
+end
+
+Players.PlayerRemoving:Connect(function(plr)
+    for i = #ESPInstances, 1, -1 do
+        local e = ESPInstances[i]
+        if e and e.Name == "ESP_" .. plr.Name then e:Destroy(); table.remove(ESPInstances, i) end
+    end
+    for i = #BillboardInstances, 1, -1 do
+        local b = BillboardInstances[i]
+        if b and b.Name == "BB_" .. plr.Name then b:Destroy(); table.remove(BillboardInstances, i) end
+    end
+    for role, p in pairs(Roles) do
+        if p == plr then Roles[role] = nil end
+    end
+end)
+
+for _, plr in ipairs(Players:GetPlayers()) do InitializePlayer(plr) end
+Players.PlayerAdded:Connect(InitializePlayer)
+WatchRoundEnd()
+
+-- Silent Aim Hook
+local mt = getrawmetatable(game)
+local oldNamecall = mt.__namecall
+setreadonly(mt, false)
+
+mt.__namecall = newcclosure(function(self, ...)
+    local method = getnamecallmethod()
+    local args = {...}
+
+    if SilentAIMEnabled then
+        RC.FilterDescendantsInstances = {Character}
+
+        if method == "FireServer" and
+           (tostring(self) == "KnifeThrown" or tostring(self) == "Throw") then
+
+            local closest = GetClosestPlayer()
+            if closest and closest.Character and closest.Character:FindFirstChild("HumanoidRootPart") then
+                local target = closest.Character.HumanoidRootPart
+                local vel = target.AssemblyLinearVelocity * Vector3.new(1, 0, 1)
+                local mag = (target.Position - Character.PrimaryPart.Position).Magnitude
+                local prediction = vel * 0.5 * mag / 100
+                local dir = (target.Position - (Character.PrimaryPart.Position + prediction)).Unit * 200
+                local result = workspace:Raycast(Character.PrimaryPart.Position, dir, RC)
+                local targetCF = result and CFrame.new(result.Position) or CFrame.new(target.Position + prediction)
+                args[1] = targetCF
+                args[2] = targetCF
+            end
+        end
+
+        if (method == "FireServer" or method == "InvokeServer") and
+           (tostring(self) == "GunFired" or tostring(self) == "ShootGun") and
+           Roles.Murderer and Roles.Murderer.Character and
+           Roles.Murderer.Character:FindFirstChild("HumanoidRootPart") then
+
+            local target = Roles.Murderer.Character.HumanoidRootPart
+            local vel = target.AssemblyLinearVelocity
+            local prediction = vel / 35
+            if math.abs(vel.Y) < 15 then
+                args[1] = target.Position + prediction
+                args[2] = target.Position + prediction
+            end
+        end
+    end
+
+    return oldNamecall(self, unpack(args))
+end)
+
+setreadonly(mt, true)
+
+Rayfield:LoadConfiguration()
+print("MM2 Rayfield Hub Loaded")
